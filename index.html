@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC button</title>
+<style>
+*{box-sizing:border-box}body{font:16px system-ui,sans-serif;margin:0;padding:24px;text-align:center;color:#222;background:white}main{max-width:440px;margin:auto}button,.file{font:inherit;padding:12px 18px;border:1px solid #bbb;border-radius:8px;background:#f5f5f5;color:#222;cursor:pointer;display:inline-block;margin:4px}button:disabled{opacity:.45;cursor:default}[hidden]{display:none!important}#qr svg{display:block;width:100%;height:auto;max-width:400px;margin:16px auto}video{width:100%;border-radius:8px}#light{width:72px;height:72px;border-radius:50%;background:#ddd;margin:28px auto}#light.on{background:#36d44b;box-shadow:0 0 24px #36d44b88}#press{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;padding:22px 38px}#press:active{background:#ddd}#status{min-height:24px}#file{display:none}
+</style>
+</head>
+<body><main>
+<p id="status" role="status" aria-live="polite">Create a QR on one device. Scan it on the other.</p>
+<section id="setup">
+<button id="create">Create QR</button><button id="scan">Scan QR</button>
+<label class="file" for="file">Scan screenshot</label><input id="file" type="file" accept="image/*">
+<div id="qr"></div>
+<video id="video" autoplay muted playsinline hidden></video>
+<button id="stop" hidden>Stop camera</button>
+</section>
+<section id="controls" hidden><div id="light" role="img" aria-label="Other device's button: released"></div><button id="press" disabled>Hold</button></section>
+</main>
+<!-- Pinned browser libraries: QR generation, QR decoding, and compression. -->
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let pc, channel, stream, frame, busy = false, held = false, pulse, expiry;
+const canvas = document.createElement('canvas');
+const context = canvas.getContext('2d', {willReadFrequently:true});
+const status = text => $('status').textContent = text;
+const fail = error => status(error.message || String(error));
+function light(on) {
+  $('light').classList.toggle('on', on);
+  $('light').setAttribute('aria-label', "Other device's button: " + (on ? 'held' : 'released'));
+}
+function send(on) { if (channel?.readyState === 'open') channel.send(on ? '1' : '0'); }
+function release() { held = false; clearInterval(pulse); send(false); }
+function attach(dc) {
+  channel = dc;
+  dc.onopen = () => {
+    stopCamera(); $('setup').hidden = true; $('controls').hidden = false;
+    $('press').disabled = false; status('Connected'); send(false);
+  };
+  dc.onmessage = event => {
+    if (event.data !== '0' && event.data !== '1') return;
+    clearTimeout(expiry); light(event.data === '1');
+    // Prevent a stuck light if the peer sleeps or its connection disappears.
+    if (event.data === '1') expiry = setTimeout(() => light(false), 1200);
+  };
+  dc.onclose = () => { release(); clearTimeout(expiry); light(false); $('press').disabled = true; status('Disconnected. Reload both pages to reconnect.'); };
+  dc.onerror = () => status('Connection error. Reload both pages to retry.');
+}
+function peer() {
+  const connection = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  connection.ondatachannel = event => attach(event.channel);
+  connection.onconnectionstatechange = () => {
+    if (['failed','disconnected','closed'].includes(connection.connectionState)) {
+      release(); light(false); $('press').disabled = true;
+      status('Connection lost. Reload both pages to retry.');
+    } else if (connection.connectionState === 'connected' && channel?.readyState === 'open') {
+      $('press').disabled = false; status('Connected');
+    }
+  };
+  return connection;
+}
+async function gather() {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve,reject) => {
+    const timeout = setTimeout(() => { cleanup(); reject(new Error('Network discovery timed out. Reload and retry.')); }, 20000);
+    const changed = () => { if (pc.iceGatheringState === 'complete') {cleanup(); resolve();} };
+    function cleanup() {clearTimeout(timeout); pc.removeEventListener('icegatheringstatechange',changed);}
+    pc.addEventListener('icegatheringstatechange',changed); changed();
+  });
+}
+function displayQR() {
+  const bytes = pako.deflate(JSON.stringify({v:1,type:pc.localDescription.type,sdp:pc.localDescription.sdp}));
+  const code = 'RTC1:' + btoa(String.fromCharCode(...bytes));
+  const qr = qrcode(0,'L'); qr.addData(code); qr.make();
+  $('qr').innerHTML = qr.createSvgTag({cellSize:4,margin:16,scalable:true});
+  $('create').hidden = true;
+}
+async function createOffer() {
+  if (busy || pc) return;
+  busy = true; $('create').disabled = true; status('Preparing QR…');
+  try {
+    pc = peer(); attach(pc.createDataChannel('button'));
+    await pc.setLocalDescription(await pc.createOffer()); await gather(); displayQR();
+    status('Other device: scan this QR. Then scan its answer here.');
+  } catch(error) { fail(error); } finally {busy = false;}
+}
+async function receive(text) {
+  if (busy) return;
+  busy = true;
+  try {
+    if (!text.startsWith('RTC1:') || text.length > 10000) throw new Error('This is not a demo handshake QR.');
+    const bytes = Uint8Array.from(atob(text.slice(5)), char => char.charCodeAt(0));
+    const data = JSON.parse(pako.inflate(bytes,{to:'string'}));
+    if (data.v !== 1 || !['offer','answer'].includes(data.type) || typeof data.sdp !== 'string' || data.sdp.length > 50000) throw new Error('Invalid handshake.');
+    if (data.type === 'offer' && pc) throw new Error('Both devices created offers. Reload this device, then scan the other device’s QR.');
+    if (data.type === 'answer' && (!pc || pc.signalingState !== 'have-local-offer')) throw new Error('Create an offer on this device before scanning an answer.');
+    stopCamera(); status('Connecting…');
+    if (data.type === 'offer') {
+      pc = peer(); await pc.setRemoteDescription({type:data.type,sdp:data.sdp});
+      await pc.setLocalDescription(await pc.createAnswer()); await gather(); displayQR();
+      status('Other device: scan this answer QR.');
+    } else {
+      await pc.setRemoteDescription({type:data.type,sdp:data.sdp});
+    }
+  } catch(error) {fail(error);} finally {busy = false;}
+}
+function decode(source,width,height) {
+  const scale = Math.min(1,1600/Math.max(width,height));
+  canvas.width = Math.round(width*scale); canvas.height = Math.round(height*scale);
+  context.drawImage(source,0,0,canvas.width,canvas.height);
+  const pixels = context.getImageData(0,0,canvas.width,canvas.height);
+  return jsQR(pixels.data,pixels.width,pixels.height,{inversionAttempts:'attemptBoth'})?.data;
+}
+function stopCamera() {
+  cancelAnimationFrame(frame); stream?.getTracks().forEach(track => track.stop());
+  stream = null; $('video').srcObject = null; $('video').hidden = true; $('stop').hidden = true;
+}
+async function scan() {
+  if (stream || busy) return;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera unavailable. Use Scan screenshot instead.');
+    stream = await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
+    $('video').srcObject = stream; $('video').hidden = false; $('stop').hidden = false;
+    await $('video').play(); status('Point the camera at the other device’s QR.');
+    let last = 0;
+    function tick(time) {
+      if (!stream) return;
+      if (time-last > 180 && $('video').videoWidth) {
+        last = time;
+        const code = decode($('video'),$('video').videoWidth,$('video').videoHeight);
+        if (code) {stopCamera(); void receive(code); return;}
+      }
+      frame = requestAnimationFrame(tick);
+    }
+    frame = requestAnimationFrame(tick);
+  } catch(error) { stopCamera(); status('Camera unavailable. Allow camera access, or use Scan screenshot.'); }
+}
+$('file').onchange = async event => {
+  const file = event.target.files[0]; if (!file || busy) return;
+  stopCamera();
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image(); image.src = url; await image.decode();
+    const code = decode(image,image.naturalWidth,image.naturalHeight);
+    if (!code) throw new Error('No readable QR found. Use a clear screenshot of the entire QR.');
+    await receive(code);
+  } catch(error) {fail(error);} finally {URL.revokeObjectURL(url); event.target.value = '';}
+};
+$('create').onclick = createOffer; $('scan').onclick = scan; $('stop').onclick = stopCamera;
+$('press').onpointerdown = event => {
+  if (event.button !== 0 || held || channel?.readyState !== 'open') return;
+  event.preventDefault(); $('press').setPointerCapture(event.pointerId); held = true; send(true);
+  pulse = setInterval(() => send(true),250);
+};
+for (const event of ['pointerup','pointercancel','lostpointercapture']) $('press').addEventListener(event,release);
+$('press').oncontextmenu = event => event.preventDefault();
+$('press').onkeydown = event => {
+  if ([' ','Enter'].includes(event.key)) {event.preventDefault(); if (!held && !event.repeat) {held = true; send(true); pulse = setInterval(() => send(true),250);}}
+};
+$('press').onkeyup = event => {if ([' ','Enter'].includes(event.key)) release();};
+window.addEventListener('blur',release);
+document.addEventListener('visibilitychange',() => {if (document.hidden) {release(); stopCamera();}});
+window.addEventListener('pagehide',() => {release(); stopCamera(); pc?.close();});
+if (!window.qrcode || !window.jsQR || !window.pako) {status('QR libraries could not load. Check your internet connection and reload.'); $('create').disabled = true; $('scan').disabled = true; $('file').disabled = true;}
+</script></body></html>
