@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WebRTC button</title>
 <style>
-*{box-sizing:border-box}body{font:16px system-ui,sans-serif;margin:0;padding:24px;text-align:center;color:#222;background:white}main{max-width:440px;margin:auto}button,.file{font:inherit;padding:12px 18px;border:1px solid #bbb;border-radius:8px;background:#f5f5f5;color:#222;cursor:pointer;display:inline-block;margin:4px}button:disabled{opacity:.45;cursor:default}[hidden]{display:none!important}#qr svg{display:block;width:100%;height:auto;max-width:400px;margin:16px auto}video{width:100%;border-radius:8px}#light{width:72px;height:72px;border-radius:50%;background:#ddd;margin:28px auto}#light.on{background:#36d44b;box-shadow:0 0 24px #36d44b88}#press{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;padding:22px 38px}#press:active{background:#ddd}#status{min-height:24px}#file{display:none}
+*{box-sizing:border-box}body{font:16px system-ui,sans-serif;margin:0;padding:24px;text-align:center;color:#222;background:white;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}main{max-width:440px;margin:auto}button,.file{font:inherit;padding:12px 18px;border:1px solid #bbb;border-radius:8px;background:#f5f5f5;color:#222;cursor:pointer;display:inline-block;margin:4px}button:disabled{opacity:.45;cursor:default}[hidden]{display:none!important}#qr svg{display:block;width:100%;height:auto;max-width:400px;margin:16px auto}video{width:100%;border-radius:8px}#light{width:72px;height:72px;border-radius:50%;background:#ddd;margin:28px auto}#light.on{background:#36d44b;box-shadow:0 0 24px #36d44b88}#press{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;padding:22px 38px}#press:active{background:#ddd}#status{min-height:24px}#latency{white-space:nowrap}#file{display:none}
 </style>
 </head>
 <body><main>
@@ -26,30 +26,65 @@
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
-let pc, channel, stream, frame, busy = false, held = false, pulse, expiry;
+let pc, channel, stream, frame, busy = false, held = false, pulse, expiry, probe;
+let sequence = 0, lastSequence = -1, probeId = 0, pendingProbe = null, latency = '—';
 const canvas = document.createElement('canvas');
 const context = canvas.getContext('2d', {willReadFrequently:true});
 const status = text => $('status').textContent = text;
 const fail = error => status(error.message || String(error));
+function connectedStatus() {
+  status('Connected · ');
+  const value = document.createElement('span');
+  value.id = 'latency'; value.textContent = latency + ' ms';
+  value.title = 'Data channel round-trip time';
+  $('status').append(value);
+}
+function measure() {
+  if (channel?.readyState !== 'open') return;
+  const now = performance.now();
+  if (pendingProbe && now - pendingProbe.started < 3000) return;
+  if (pendingProbe) { latency = '—'; connectedStatus(); }
+  pendingProbe = {id: ++probeId, started: now};
+  channel.send('P:' + probeId);
+}
 function light(on) {
   $('light').classList.toggle('on', on);
   $('light').setAttribute('aria-label', "Other device's button: " + (on ? 'held' : 'released'));
 }
-function send(on) { if (channel?.readyState === 'open') channel.send(on ? '1' : '0'); }
-function release() { held = false; clearInterval(pulse); send(false); }
+function send(on) {
+  if (channel?.readyState === 'open' && channel.bufferedAmount < 1024)
+    channel.send('S:' + (++sequence) + ':' + (on ? '1' : '0'));
+}
+function release() {
+  if (!held) return;
+  held = false; clearInterval(pulse); send(false);
+}
 function attach(dc) {
   channel = dc;
   dc.onopen = () => {
     stopCamera(); $('setup').hidden = true; $('controls').hidden = false;
-    $('press').disabled = false; status('Connected'); send(false);
+    $('press').disabled = false; connectedStatus(); send(false);
+    measure(); probe = setInterval(measure, 1000);
   };
   dc.onmessage = event => {
-    if (event.data !== '0' && event.data !== '1') return;
-    clearTimeout(expiry); light(event.data === '1');
+    const data = event.data;
+    if (typeof data !== 'string') return;
+    if (data.startsWith('P:')) { dc.send('A:' + data.slice(2)); return; }
+    if (data.startsWith('A:')) {
+      if (pendingProbe && data.slice(2) === String(pendingProbe.id)) {
+        latency = String(Math.round(performance.now() - pendingProbe.started));
+        pendingProbe = null; connectedStatus();
+      }
+      return;
+    }
+    const match = /^S:(\d+):([01])$/.exec(data);
+    if (!match || Number(match[1]) <= lastSequence) return;
+    lastSequence = Number(match[1]);
+    clearTimeout(expiry); light(match[2] === '1');
     // Prevent a stuck light if the peer sleeps or its connection disappears.
-    if (event.data === '1') expiry = setTimeout(() => light(false), 1200);
+    if (match[2] === '1') expiry = setTimeout(() => light(false), 1200);
   };
-  dc.onclose = () => { release(); clearTimeout(expiry); light(false); $('press').disabled = true; status('Disconnected. Reload both pages to reconnect.'); };
+  dc.onclose = () => { release(); clearInterval(probe); probe = null; pendingProbe = null; clearTimeout(expiry); light(false); $('press').disabled = true; status('Disconnected. Reload both pages to reconnect.'); };
   dc.onerror = () => status('Connection error. Reload both pages to retry.');
 }
 function peer() {
@@ -57,10 +92,11 @@ function peer() {
   connection.ondatachannel = event => attach(event.channel);
   connection.onconnectionstatechange = () => {
     if (['failed','disconnected','closed'].includes(connection.connectionState)) {
-      release(); light(false); $('press').disabled = true;
+      release(); clearInterval(probe); probe = null; pendingProbe = null; light(false); $('press').disabled = true;
       status('Connection lost. Reload both pages to retry.');
     } else if (connection.connectionState === 'connected' && channel?.readyState === 'open') {
-      $('press').disabled = false; status('Connected');
+      $('press').disabled = false; connectedStatus();
+      if (!probe) { measure(); probe = setInterval(measure, 1000); }
     }
   };
   return connection;
@@ -85,7 +121,7 @@ async function createOffer() {
   if (busy || pc) return;
   busy = true; $('create').disabled = true; status('Preparing QR…');
   try {
-    pc = peer(); attach(pc.createDataChannel('button'));
+    pc = peer(); attach(pc.createDataChannel('button', {ordered:false, maxRetransmits:0}));
     await pc.setLocalDescription(await pc.createOffer()); await gather(); displayQR();
     status('Other device: scan this QR. Then scan its answer here.');
   } catch(error) { fail(error); } finally {busy = false;}
@@ -156,12 +192,12 @@ $('create').onclick = createOffer; $('scan').onclick = scan; $('stop').onclick =
 $('press').onpointerdown = event => {
   if (event.button !== 0 || held || channel?.readyState !== 'open') return;
   event.preventDefault(); $('press').setPointerCapture(event.pointerId); held = true; send(true);
-  pulse = setInterval(() => send(true),250);
+  pulse = setInterval(() => send(true),150);
 };
 for (const event of ['pointerup','pointercancel','lostpointercapture']) $('press').addEventListener(event,release);
 $('press').oncontextmenu = event => event.preventDefault();
 $('press').onkeydown = event => {
-  if ([' ','Enter'].includes(event.key)) {event.preventDefault(); if (!held && !event.repeat) {held = true; send(true); pulse = setInterval(() => send(true),250);}}
+  if ([' ','Enter'].includes(event.key)) {event.preventDefault(); if (!held && !event.repeat) {held = true; send(true); pulse = setInterval(() => send(true),150);}}
 };
 $('press').onkeyup = event => {if ([' ','Enter'].includes(event.key)) release();};
 window.addEventListener('blur',release);
