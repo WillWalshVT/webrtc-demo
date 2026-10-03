@@ -129,9 +129,10 @@ try {
 const $ = id => document.getElementById(id);
 const APP_URL = location.origin + location.pathname;
 const configFor = (appId, password) => ({appId, password, rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
-const STORAGE_KEY = 'webrtc-signal-chat-session-v3';
+const STORAGE_KEY = 'webrtc-signal-chat-session-v4';
+const SLOT_KEY = 'webrtc-signal-chat-tab-slot';
 const names = new Map(), messages = new Map(), members = new Map(), peerMembers = new Map();
-let mesh, meshId, meshKey, sessionAppId, memberId, memberKey, localName, roomName, invite, joinAttempt, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
+let mesh, meshId, meshKey, sessionAppId, memberId, memberKey, localName, roomName, invite, joinAttempt, sessionSlot, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
@@ -203,17 +204,31 @@ function decode(value) {
 }
 function normalizeName(value, limit) { const name = typeof value === 'string' ? value.trim() : ''; return name && name.length <= limit ? name : null; }
 function validToken(value, length = 24) { return typeof value === 'string' && new RegExp('^[A-Za-z0-9_-]{' + length + '}$').test(value); }
+function ensureSessionSlot() {
+  if (!sessionSlot) {
+    sessionSlot = token(12);
+    try { sessionStorage.setItem(SLOT_KEY,sessionSlot); } catch {}
+  }
+}
+function newSessionSlot() {
+  sessionSlot = null;
+  ensureSessionSlot();
+}
 function saveSession() {
   if (!mesh || !memberId) return;
+  ensureSessionSlot();
   try {
-    localStorage.setItem(STORAGE_KEY,JSON.stringify({v:3,appId:sessionAppId,meshId,meshKey,memberId,memberKey,localName,roomName,members:[...members],messages:[...messages.values()]}));
+    localStorage.setItem(STORAGE_KEY + ':' + sessionSlot,JSON.stringify({v:4,appId:sessionAppId,meshId,meshKey,memberId,memberKey,localName,roomName,members:[...members],messages:[...messages.values()]}));
   } catch { notice('This browser cannot save the session. Refresh will require a new invite.',true); }
 }
-function clearSavedSession() { try { localStorage.removeItem(STORAGE_KEY); } catch {} }
+function clearSavedSession() {
+  try { if (sessionSlot) localStorage.removeItem(STORAGE_KEY + ':' + sessionSlot); sessionStorage.removeItem(SLOT_KEY); } catch {}
+  sessionSlot = null;
+}
 function restoreSession() {
   let saved;
-  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { return false; }
-  if (saved?.v !== 3 || !validToken(saved.appId) || !validToken(saved.meshId) || !validToken(saved.meshKey) ||
+  try { sessionSlot = sessionStorage.getItem(SLOT_KEY); saved = JSON.parse(localStorage.getItem(STORAGE_KEY + ':' + sessionSlot) || 'null'); } catch { return false; }
+  if (!validToken(sessionSlot,16) || saved?.v !== 4 || !validToken(saved.appId) || !validToken(saved.meshId) || !validToken(saved.meshKey) ||
       !validToken(saved.memberId,16) || !validToken(saved.memberKey) || !normalizeName(saved.localName,24) ||
       !normalizeName(saved.roomName,48) || !Array.isArray(saved.members) || saved.members.length > 1000) return false;
   const restored = new Map();
@@ -430,6 +445,7 @@ function beginJoin() {
   if (!current || Date.now() > current.data.expires) { cancelJoin(); notice('Invite expired. Scan a new code.', true); return; }
   localName = normalizeName($('join-name').value,24);
   if (!localName) return;
+  newSessionSlot();
   memberId = token(12); memberKey = token();
   const room = joinRoom(configFor(current.data.appId,current.data.secret), 'invite-' + current.data.id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
@@ -582,6 +598,7 @@ $('host-form').onsubmit = event => {
   event.preventDefault();
   const name = normalizeName($('host-name').value,24), title = normalizeName($('room-name').value,48);
   if (!name || !title) return;
+  newSessionSlot();
   localName = name; roomName = title; sessionAppId = token(); memberId = token(12); memberKey = token();
   members.clear(); members.set(memberId,{key:memberKey,name:localName});
   openMesh(token(),token());
