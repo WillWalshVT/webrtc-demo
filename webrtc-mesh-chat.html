@@ -242,6 +242,7 @@ function roster() {
 function attach(peer, dc) {
   peer.dc = dc;
   dc.onopen = () => {
+    notice('');
     if (peer.id && peers.get(peer.id) !== peer) peers.set(peer.id, peer);
     clearTimeout(offlineTimers.get(peer.id)); offlineTimers.delete(peer.id);
     send(peer, {kind:'hello', room:roomId, id:localId, name:localName});
@@ -263,7 +264,10 @@ function attach(peer, dc) {
       if (peer.pc.signalingState !== 'closed') peer.pc.close();
     }
   };
-  dc.onerror = () => notice('A peer connection reported an error.', true);
+  dc.onerror = () => {
+    if (peer.pc.connectionState !== 'closed' && peer.id && peers.get(peer.id) === peer)
+      notice('A peer connection reported an error.', true);
+  };
 }
 async function handleMessage(peer, message) {
   if (message.kind === 'hello') {
