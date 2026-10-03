@@ -291,7 +291,7 @@ function renderMessages() {
   }
   if (bottom) list.scrollTop = list.scrollHeight;
 }
-function openMesh(id, key, knownPeers = []) {
+function openMesh(id, key) {
   meshId = id; meshKey = key;
   mesh = joinRoom(configFor(sessionAppId,key), 'mesh-' + id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
@@ -317,6 +317,7 @@ function openMesh(id, key, knownPeers = []) {
   mesh.onPeerJoin = peerId => {
     const name = members.get(peerMembers.get(peerId))?.name;
     logEvent(name || 'A member','joined');
+    if ($('notice').textContent === 'Rejoining your saved room.') notice('');
     renderPeers();
     void nameAction.send(localName, {target:peerId}).catch(() => {});
     const recent = [...messages.values()].filter(item => item.kind !== 'event').sort((a,b) => b.time-a.time).slice(0,30);
@@ -455,7 +456,12 @@ function beginJoin() {
     },
     onJoinError:details => {
       if (details.peerId === current.data.host && joinAttempt === current) {
-        cancelJoin(); notice('Invite unavailable or connection failed. Ask for a new code, or try again.',true);
+        const reason = String(details.error?.message || details.error || '');
+        if (/Invite closed|Invalid access proof|Unexpected inviter|incorrect password/i.test(reason)) {
+          cancelJoin(); notice('This invite is no longer valid. Ask for a new code.',true);
+        } else {
+          $('joining-text').textContent = 'Still checking the invite...';
+        }
       }
     }
   });
@@ -485,7 +491,7 @@ function beginJoin() {
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
   show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...';
-  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Invite unavailable. Ask for a new code.', true); } }, 12000);
+  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Invite rejected: it may be closed or the inviter could not be reached. Ask for a new code.', true); } }, 12000);
 }
 async function leaveRoom() {
   closeInvite(); cancelJoin();
