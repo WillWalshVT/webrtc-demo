@@ -71,6 +71,9 @@ dialog::backdrop{background:#11252999}
 .dialog-head h2{margin:0}
 .scanner-video{width:100%;aspect-ratio:4/3;object-fit:contain;background:#182b2d;border-radius:4px;margin:16px 0}
 .scanner-video.mirrored{transform:scaleX(-1)}
+.scanner-preview{position:relative;margin:16px 0}
+.scanner-preview .scanner-video{margin:0}
+.mirror-button{position:absolute;right:9px;bottom:9px;width:38px;height:38px;min-height:38px;padding:0;background:#fff;border-color:#fff;box-shadow:0 2px 8px #0005;font-size:23px;line-height:1}
 .scanner-tools{display:grid;gap:14px;margin-top:16px}
 .scanner-tools .field{margin:0;max-width:none}
 .file-input{padding:8px}
@@ -84,9 +87,8 @@ dialog::backdrop{background:#11252999}
 <section id="entry">
   <h1>Start a session</h1>
   <p class="muted">Connect devices directly with a QR exchange.</p>
-  <div class="field"><label for="username">Your name</label><input id="username" maxlength="24" autocomplete="nickname" required placeholder="Enter a username"></div>
-  <div class="field"><label for="room-name">Room name <span class="muted small">(when creating)</span></label><input id="room-name" maxlength="48" placeholder="Name your room"></div>
-  <div class="actions"><button class="button primary" id="create">Create</button><button class="button" id="join">Join</button></div>
+  <div id="entry-choice" class="actions"><button class="button primary" id="create">Create</button><button class="button" id="join">Join</button></div>
+  <form id="entry-form" hidden><h2 id="entry-title"></h2><div class="field"><label for="username">Your name</label><input id="username" maxlength="24" autocomplete="nickname" required placeholder="Enter a username"></div><div class="field" id="room-name-field"><label for="room-name">Room name</label><input id="room-name" maxlength="48" placeholder="Name your room"></div><div class="actions"><button class="button primary" id="start-session" type="submit">Continue</button><button class="button quiet" id="back-entry" type="button">Back</button></div></form>
   <p id="prefill" class="banner" hidden></p>
 </section>
 <section id="joining" hidden>
@@ -102,7 +104,7 @@ dialog::backdrop{background:#11252999}
 </main>
 </div>
 <dialog id="invite-dialog"><div class="dialog-inner"><div class="dialog-head"><h2>Invite a client</h2><button class="button quiet" id="cancel-invite" aria-label="Close invitation">Close</button></div><p class="hint">Scan this QR on the other device. It can open this page directly.</p><div id="invite-qr" class="qr"></div><div class="actions"><button class="button primary" id="scan-answer" hidden>Scan client code</button><button class="button" id="copy-invite" disabled>Copy invite link</button></div><p id="invite-copy" class="link-line" hidden></p><p id="invite-note" class="hint"></p></div></dialog>
-<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><div class="actions"><button class="button" id="flip-camera" hidden>Switch camera</button><button class="button" id="mirror-camera" hidden>Mirror preview</button></div><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
+<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><div class="scanner-preview"><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><button class="button mirror-button" id="mirror-camera" type="button" aria-label="Mirror preview" title="Mirror preview" hidden><span aria-hidden="true">⇄</span></button></div><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a photo or screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
@@ -118,7 +120,7 @@ const pendingCandidates = new Map();
 const chatHistory = new Map();
 let localId, localName, roomId, roomName, pendingInvite, pendingJoin, inviteLink, answerCode;
 let scanStream, scanFrame, scanKind, scanLast = 0, barcodeDetector, scanAttempts = 0, scanBusy = false;
-let cameraDevices = [], cameraIndex = -1, scannerRun = 0;
+let scannerRun = 0, entryMode = null;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
@@ -144,6 +146,16 @@ function clearPrefill() {
   $('prefill').textContent = '';
   delete $('prefill').dataset.code;
 }
+function setEntryMode(mode) {
+  entryMode = mode;
+  $('entry-choice').hidden = !!mode;
+  $('entry-form').hidden = !mode;
+  if (!mode) return;
+  $('entry-title').textContent = mode === 'create' ? 'Create a room' : 'Join a room';
+  $('room-name-field').hidden = mode !== 'create';
+  $('start-session').textContent = mode === 'create' ? 'Create room' : 'Continue';
+  $('username').focus();
+}
 function encode(data) {
   const bytes = pako.deflate(JSON.stringify(data));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -160,7 +172,7 @@ function qr(value, element) {
   element.textContent = '';
   const code = qrcode(0, 'L');
   code.addData(value); code.make();
-  element.innerHTML = code.createSvgTag({cellSize:4, margin:12, scalable:true});
+  element.innerHTML = code.createSvgTag({cellSize:4, margin:24, scalable:true});
 }
 function show(section) {
   for (const id of ['entry','joining','room']) $(id).hidden = id !== section;
@@ -439,6 +451,7 @@ function resetRoom() {
   $('invite-dialog').close(); $('scan-answer').hidden = true;
   $('history-state').hidden = true; renderMessages();
   clearPrefill();
+  setEntryMode(null);
   show('entry');
 }
 async function createInvite() {
@@ -534,7 +547,6 @@ function stopScanner() {
   scanStream = null;
   $('scanner-video').srcObject = null;
   $('scanner-video').hidden = true;
-  $('flip-camera').hidden = true;
   $('mirror-camera').hidden = true;
 }
 async function useCode(raw) {
@@ -554,7 +566,6 @@ async function openScanner(kind) {
   $('scanner-note').textContent = 'Fill the camera view with the QR code, or scan a screenshot or paste a code.';
   $('scan-text').value = ''; $('scan-file').value = '';
   $('scanner').showModal();
-  cameraIndex = -1;
   try {
     barcodeDetector = null;
     if ('BarcodeDetector' in window) {
@@ -565,14 +576,14 @@ async function openScanner(kind) {
     await startCamera();
   } catch { stopScanner(); $('scanner-note').textContent = 'Camera unavailable. Scan a screenshot or paste a code.'; }
 }
-async function startCamera(deviceId) {
+async function startCamera() {
   const run = ++scannerRun;
   cancelAnimationFrame(scanFrame);
   scanStream?.getTracks().forEach(track => track.stop());
   scanStream = null;
   const video = $('scanner-video');
   video.srcObject = null;
-  const constraints = deviceId ? {deviceId:{exact:deviceId}, width:{ideal:1920}, height:{ideal:1440}} : {facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1440}};
+  const constraints = {facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1440}};
   const stream = await navigator.mediaDevices.getUserMedia({audio:false, video:constraints});
   if (run !== scannerRun || !$('scanner').open) { stream.getTracks().forEach(track => track.stop()); return; }
   scanStream = stream;
@@ -581,11 +592,8 @@ async function startCamera(deviceId) {
   const facing = stream.getVideoTracks()[0].getSettings().facingMode;
   const mirrored = facing !== 'environment';
   video.classList.toggle('mirrored', mirrored);
-  $('mirror-camera').textContent = mirrored ? 'Unmirror preview' : 'Mirror preview';
-  try { cameraDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput'); }
-  catch { cameraDevices = []; }
-  cameraIndex = cameraDevices.findIndex(device => device.deviceId === stream.getVideoTracks()[0].getSettings().deviceId);
-  $('flip-camera').hidden = cameraDevices.length < 2;
+  $('mirror-camera').setAttribute('aria-label', mirrored ? 'Unmirror preview' : 'Mirror preview');
+  $('mirror-camera').title = mirrored ? 'Unmirror preview' : 'Mirror preview';
   $('mirror-camera').hidden = false;
   scanLast = 0;
   async function tick(now) {
@@ -607,14 +615,10 @@ async function startCamera(deviceId) {
 }
 $('scanner').addEventListener('close', stopScanner);
 $('close-scanner').onclick = () => $('scanner').close();
-$('flip-camera').onclick = () => {
-  if (cameraDevices.length < 2) return;
-  cameraIndex = (cameraIndex + 1) % cameraDevices.length;
-  void startCamera(cameraDevices[cameraIndex].deviceId).catch(error => { $('scanner-note').textContent = 'Could not switch camera: ' + error.message; });
-};
 $('mirror-camera').onclick = () => {
   const mirrored = $('scanner-video').classList.toggle('mirrored');
-  $('mirror-camera').textContent = mirrored ? 'Unmirror preview' : 'Mirror preview';
+  $('mirror-camera').setAttribute('aria-label', mirrored ? 'Unmirror preview' : 'Mirror preview');
+  $('mirror-camera').title = mirrored ? 'Unmirror preview' : 'Mirror preview';
 };
 $('use-pasted-code').onclick = () => void useCode($('scan-text').value);
 $('scan-file').onchange = async event => {
@@ -632,8 +636,18 @@ $('scan-file').onchange = async event => {
   } catch (error) { $('scanner-note').textContent = error.message; }
   finally { URL.revokeObjectURL(url); event.target.value = ''; }
 };
-$('create').onclick = async () => {
+$('create').onclick = () => setEntryMode('create');
+$('join').onclick = () => setEntryMode('join');
+$('back-entry').onclick = () => setEntryMode(null);
+$('entry-form').onsubmit = async event => {
+  event.preventDefault();
   const name = nameFromInput(); if (!name) return;
+  if (entryMode === 'join') {
+    const prefill = $('prefill').dataset.code;
+    if (prefill) void joinOffer(prefill).catch(error => { clearPrefill(); notice(error.message, true); void openScanner('invite'); });
+    else void openScanner('invite');
+    return;
+  }
   const input = $('room-name'); input.value = input.value.trim();
   if (!isRoomName(input.value)) { input.setCustomValidity('Enter a room name.'); input.reportValidity(); return; }
   input.setCustomValidity('');
@@ -643,12 +657,6 @@ $('create').onclick = async () => {
   show('room'); renderPeers(); await createInvite();
 };
 $('room-name').addEventListener('input', () => $('room-name').setCustomValidity(''));
-$('join').onclick = () => {
-  if (!nameFromInput()) return;
-  const prefill = $('prefill').dataset.code;
-  if (prefill) { void joinOffer(prefill).catch(error => { clearPrefill(); notice(error.message, true); void openScanner('invite'); }); }
-  else void openScanner('invite');
-};
 $('add-client').onclick = () => void createInvite();
 $('scan-answer').onclick = () => void openScanner('answer');
 $('cancel-invite').onclick = cancelInvite;
