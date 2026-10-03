@@ -578,6 +578,10 @@ async function startCamera(deviceId) {
   scanStream = stream;
   video.srcObject = stream; video.hidden = false;
   await video.play();
+  const facing = stream.getVideoTracks()[0].getSettings().facingMode;
+  const mirrored = facing !== 'environment';
+  video.classList.toggle('mirrored', mirrored);
+  $('mirror-camera').textContent = mirrored ? 'Unmirror preview' : 'Mirror preview';
   try { cameraDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput'); }
   catch { cameraDevices = []; }
   cameraIndex = cameraDevices.findIndex(device => device.deviceId === stream.getVideoTracks()[0].getSettings().deviceId);
