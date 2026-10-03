@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WebRTC Signal Chat</title>
+<link rel="preconnect" href="https://esm.run" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="modulepreload" href="https://esm.run/trystero@0.25.4">
 <style>
 :root{font:16px system-ui,sans-serif;color:#1b292d;background:#f4f7f6;color-scheme:light}
 *{box-sizing:border-box}
@@ -38,6 +41,7 @@ input:focus,textarea:focus{outline:2px solid #16837a;outline-offset:1px}
 .banner.error{border-color:#be5448;background:#fff0ed;color:#913c31}
 .room-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:20px}
 .room-head h1{margin-bottom:4px;overflow-wrap:anywhere}
+.pipeline{font-size:13px;color:#126c68;font-weight:600;margin-top:6px}
 .room-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .layout{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:24px}
 .conversation{min-width:0;height:min(65vh,630px);min-height:340px;display:flex;flex-direction:column;border:1px solid #d5dfdd;border-radius:5px;background:white}
@@ -105,7 +109,7 @@ dialog::backdrop{background:#11252999}
   <button class="button quiet" id="cancel-joining">Cancel</button>
 </section>
 <section id="room" hidden>
-  <div class="room-head"><div><h1 id="room-title">Chatroom</h1><div id="room-summary" class="muted small">Waiting for a peer</div></div><div class="room-actions"><button class="button primary" id="invite-more">Invite</button><button class="button quiet" id="leave">Leave</button></div></div>
+  <div class="room-head"><div><h1 id="room-title">Chatroom</h1><div id="room-summary" class="muted small">Waiting for a peer</div><div id="pipeline" class="pipeline" role="status">Ready</div></div><div class="room-actions"><button class="button primary" id="invite-more">Invite</button><button class="button quiet" id="leave">Leave</button></div></div>
   <div class="layout"><div class="conversation"><div class="messages" id="messages" role="log" aria-live="polite"><p class="empty">Messages will appear here.</p></div><form class="composer" id="composer"><input id="message" maxlength="2000" autocomplete="off" aria-label="Message" placeholder="Message the room"><button class="button primary" type="submit">Send</button></form></div><aside class="peers"><h2>People <span id="peer-count">(1)</span></h2><ul id="peer-list" class="peer-list"></ul><p id="mesh-state" class="muted small"></p></aside></div>
 </section>
 <p id="notice" class="banner" role="status" hidden></p>
@@ -128,11 +132,11 @@ try {
 }
 const $ = id => document.getElementById(id);
 const APP_URL = location.origin + location.pathname;
-const configFor = (appId, password) => ({appId, password, rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
+const configFor = (appId, password) => ({appId, password, trickleIce:true});
 const STORAGE_KEY = 'webrtc-signal-chat-session-v4';
 const SLOT_KEY = 'webrtc-signal-chat-tab-slot';
-const names = new Map(), messages = new Map(), members = new Map(), peerMembers = new Map();
-let mesh, meshId, meshKey, sessionAppId, memberId, memberKey, localName, roomName, invite, joinAttempt, sessionSlot, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
+const names = new Map(), messages = new Map(), members = new Map(), peerMembers = new Map(), fastLinks = new Map(), inviteRooms = new Set();
+let mesh, meshId, meshKey, sessionAppId, memberId, memberKey, localName, roomName, invite, joinAttempt, fastGuest, sessionSlot, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
@@ -247,8 +251,8 @@ function show(section) { for (const id of ['home','host-setup','join-setup','joi
 function notice(message, error = false) { $('notice').textContent = message; $('notice').classList.toggle('error', error); $('notice').hidden = !message; }
 function renderPeers() {
   const list = $('peer-list'); list.textContent = '';
-  const peers = mesh ? Object.keys(mesh.getPeers()) : [];
-  for (const [id, name] of [[selfId, localName], ...peers.map(id => [id, names.get(id) || members.get(peerMembers.get(id))?.name || 'Connecting'])]) {
+  const peers = [...new Set([...(mesh ? Object.keys(mesh.getPeers()) : []),...fastLinks.keys(),...(fastGuest ? [fastGuest.peerId] : [])])];
+  for (const [id, name] of [[selfId, localName], ...peers.map(id => [id, names.get(id) || members.get(peerMembers.get(id))?.name || fastLinks.get(id)?.name || 'Inviter'])]) {
     const li = document.createElement('li');
     const dot = document.createElement('span'); dot.className = 'dot';
     const label = document.createElement('span'); label.className = 'name'; label.textContent = name;
@@ -257,9 +261,25 @@ function renderPeers() {
   }
   $('peer-count').textContent = '(' + (peers.length + 1) + ')';
   $('room-summary').textContent = peers.length ? peers.length + ' connected peer' + (peers.length === 1 ? '' : 's') : 'Waiting for a peer';
-  $('mesh-state').textContent = peers.length ? 'Direct links to all connected peers are ready.' : 'Invite someone to begin.';
+  $('mesh-state').textContent = fastGuest || fastLinks.size ? 'Chat is available while the private mesh connects.' : peers.length ? 'Private mesh connected.' : 'Invite someone to begin.';
   $('message').disabled = !peers.length;
   $('composer').querySelector('button').disabled = !peers.length;
+  $('invite-more').disabled = Boolean(fastGuest);
+}
+function sendChat(item, exceptPeerId) {
+  const meshPeers = mesh ? Object.keys(mesh.getPeers()).filter(id => id !== exceptPeerId) : [];
+  if (meshPeers.length) void mesh.actions.chatAction.send(item,{target:meshPeers}).catch(() => notice('A message could not reach every peer.',true));
+  if (fastGuest && fastGuest.peerId !== exceptPeerId && !meshPeers.includes(fastGuest.peerId)) {
+    void fastGuest.chat.send(item,{target:fastGuest.peerId}).catch(() => notice('Message could not be sent.',true));
+  }
+  for (const [peerId,link] of fastLinks) {
+    if (peerId !== exceptPeerId && !meshPeers.includes(peerId)) void link.chat.send(item,{target:peerId}).catch(() => {});
+  }
+}
+function sendFastChat(item, exceptPeerId) {
+  for (const [peerId,link] of fastLinks) {
+    if (peerId !== exceptPeerId && !(mesh && mesh.getPeers()[peerId])) void link.chat.send(item,{target:peerId}).catch(() => {});
+  }
 }
 function recordMessage(item) {
   if (!item || typeof item.id !== 'string' || item.id.length > 80 || !['chat','event'].includes(item.kind || 'chat') ||
@@ -298,16 +318,23 @@ function openMesh(id, key) {
       await memberHandshake(peerId,send,receive,isInitiator);
       if (!members.has(peerMembers.get(peerId))) throw new Error('Admission revoked');
     },
-    onJoinError: details => { if (details.peerId && members.has(peerMembers.get(details.peerId))) notice('Could not connect to a peer. This network may require a relay.', true); }
+    onJoinError: details => {
+      if (details.peerId === fastGuest?.peerId || fastLinks.has(details.peerId)) $('pipeline').textContent = 'Chat ready · private mesh delayed';
+      else if (details.peerId && members.has(peerMembers.get(details.peerId))) notice('Direct link to a peer failed. This network may need TURN.', true);
+    }
   });
   const nameAction = mesh.makeAction('name');
   const chatAction = mesh.makeAction('chat');
+  const bridgeAction = mesh.makeAction('bridge-chat');
   const historyAction = mesh.makeAction('history');
   const grantAction = mesh.makeAction('grant');
   const revokeAction = mesh.makeAction('revoke');
-  mesh.actions = {nameAction, chatAction, historyAction, grantAction, revokeAction};
+  mesh.actions = {nameAction, chatAction, bridgeAction, historyAction, grantAction, revokeAction};
   nameAction.onMessage = (name, {peerId}) => { if (typeof name === 'string' && name.length <= 24 && name.trim()) { names.set(peerId, name.trim()); renderPeers(); } };
-  chatAction.onMessage = (item, {peerId}) => { if (item?.from === peerId) recordMessage(item); };
+  chatAction.onMessage = (item, {peerId}) => { if (item?.from === peerId && recordMessage(item)) sendFastChat(item,peerId); };
+  bridgeAction.onMessage = ({item,memberId:originId}, {peerId}) => {
+    if (members.has(peerMembers.get(peerId)) && members.get(originId)?.name === item?.name && recordMessage(item)) sendFastChat(item);
+  };
   historyAction.onMessage = items => { if (Array.isArray(items) && items.length <= 30) items.forEach(recordMessage); };
   grantAction.onMessage = ({id:addedId, key:addedKey, name}) => {
     if (!validToken(addedId,16) || !validToken(addedKey) || !normalizeName(name || '',24)) return;
@@ -315,19 +342,39 @@ function openMesh(id, key) {
   };
   revokeAction.onMessage = ({id:removedId}) => { if (validToken(removedId,16)) { members.delete(removedId); saveSession(); } };
   mesh.onPeerJoin = peerId => {
+    const handoffStartedAt = fastGuest?.peerId === peerId ? joinAttempt?.startedAt : null;
     const name = members.get(peerMembers.get(peerId))?.name;
-    logEvent(name || 'A member','joined');
+    if (!fastLinks.has(peerId) && fastGuest?.peerId !== peerId) logEvent(name || 'A member','joined');
     if ($('notice').textContent === 'Rejoining your saved room.') notice('');
     renderPeers();
     void nameAction.send(localName, {target:peerId}).catch(() => {});
     const recent = [...messages.values()].filter(item => item.kind !== 'event').sort((a,b) => b.time-a.time).slice(0,30);
     if (recent.length) void historyAction.send(recent, {target:peerId}).catch(() => {});
+    if (fastGuest?.peerId === peerId) {
+      const link = fastGuest; fastGuest = null;
+      if (joinAttempt?.room === link.room) { clearTimeout(joinAttempt.timer); joinAttempt = null; }
+      link.room.leave(); $('pipeline').textContent = 'Private mesh ready' + (handoffStartedAt ? ' in ' + ((performance.now()-handoffStartedAt)/1000).toFixed(1) + 's' : '');
+    }
+    const fast = fastLinks.get(peerId);
+    if (fast) {
+      if (fast.invite.pending.has(peerId)) {
+        fast.invite.pending.delete(peerId); fast.invite.admitted.add(peerId);
+        logEvent(fast.name || 'A member','joined');
+        if (fast.invite.open && invite === fast.invite) $('invite-status').textContent = 'Invite open. ' + fast.invite.admitted.size + ' joined.';
+      }
+      fastLinks.delete(peerId); releaseInviteRoom(fast.invite);
+    }
+    if (!fastGuest && !fastLinks.size && !handoffStartedAt) $('pipeline').textContent = 'Private mesh ready';
+    renderPeers();
   };
   mesh.onPeerLeave = peerId => {
     const name = names.get(peerId) || members.get(peerMembers.get(peerId))?.name || 'A member';
-    logEvent(name,'left'); names.delete(peerId); peerMembers.delete(peerId); renderPeers();
+    if (!fastLinks.has(peerId) && fastGuest?.peerId !== peerId) logEvent(name,'left');
+    else $('pipeline').textContent = 'Chat ready · reconnecting private mesh';
+    names.delete(peerId); peerMembers.delete(peerId); renderPeers();
   };
   $('room-title').textContent = roomName;
+  $('pipeline').textContent = 'Ready to invite';
   renderPeers(); show('room'); saveSession();
 }
 async function grantPeer(id, key, name) {
@@ -342,6 +389,11 @@ function revokeMember(id) {
   members.delete(id); saveSession();
   if (mesh) void mesh.actions.revokeAction.send({id}).catch(() => {});
 }
+function releaseInviteRoom(current) {
+  if (!current || current.open || [...fastLinks.values()].some(link => link.invite === current)) return;
+  if (invite === current) { invite = null; clearTimeout(current.timer); }
+  current.room.leave(); inviteRooms.delete(current);
+}
 function closeInvite() {
   const active = invite; invite = null;
   $('invite-active').hidden = true; $('invite-qr').textContent = '';
@@ -349,8 +401,12 @@ function closeInvite() {
   if (!active) return;
   clearTimeout(active.timer);
   active.open = false;
-  for (const addedId of active.pending.values()) revokeMember(addedId);
-  active.room.leave();
+  for (const [peerId,addedId] of active.pending) {
+    if (!active.admitted.has(peerId) && !mesh?.getPeers()[peerId]) {
+      fastLinks.delete(peerId); revokeMember(addedId);
+    }
+  }
+  releaseInviteRoom(active);
 }
 function qr(value, element) {
   const code = qrcode(0,'L'); code.addData(value); code.make();
@@ -368,8 +424,17 @@ function createInvite(multi) {
     onJoinError:() => {}
   });
   const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request'), ready = room.makeAction('ready');
-  const current = {id, room, admit, ack, deny, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null};
+  const fastChat = room.makeAction('fast-chat'), fastHistory = room.makeAction('fast-history');
+  const current = {id, room, admit, ack, deny, fastChat, fastHistory, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null};
   invite = current;
+  inviteRooms.add(current);
+  fastChat.onMessage = (item,{peerId}) => {
+    const link = fastLinks.get(peerId);
+    if (!link || item?.from !== peerId || !recordMessage(item)) return;
+    sendFastChat(item,peerId);
+    const peers = Object.keys(mesh.getPeers()).filter(id => id !== peerId);
+    if (peers.length) void mesh.actions.bridgeAction.send({item,memberId:link.memberId},{target:peers}).catch(() => {});
+  };
   room.onPeerJoin = peerId => {
     if (invite !== current || !current.open || Date.now() > current.expires || (!multi && current.claimed)) {
       void deny.send('This invite is closed.',{target:peerId}).catch(() => {}); return;
@@ -379,20 +444,38 @@ function createInvite(multi) {
       current.open = false;
       $('invite-active').hidden = true; $('invite-qr').textContent = '';
       if ($('invite-dialog').open) $('invite-dialog').close();
+      $('pipeline').textContent = 'Invite verified · waiting for name';
     } else {
       $('invite-status').textContent = 'New user connecting...';
+      $('pipeline').textContent = 'New user connecting';
     }
     void ready.send({inviteId:id},{target:peerId}).catch(() => {});
   };
   room.onPeerLeave = peerId => {
-    if (invite !== current) return;
-    if (!multi && current.claimed === peerId) closeInvite();
-    else if (multi) $('invite-status').textContent = 'Invite open. ' + current.admitted.size + ' joined.';
+    if (current.pending.has(peerId) && mesh.getPeers()[peerId]) {
+      current.pending.delete(peerId); current.admitted.add(peerId);
+      logEvent(fastLinks.get(peerId)?.name || 'A member','joined');
+    }
+    const fast = fastLinks.get(peerId);
+    if (fast && !mesh.getPeers()[peerId]) logEvent(fast.name || 'A member','left');
+    fastLinks.delete(peerId); renderPeers();
+    if (invite === current) {
+      if (!multi && current.claimed === peerId) closeInvite();
+      else if (multi) $('invite-status').textContent = 'Invite open. ' + current.admitted.size + ' joined.';
+    }
+    releaseInviteRoom(current);
   };
   request.onMessage = (identity, {peerId}) => void handleInvitePeer(current,peerId,identity);
   ack.onMessage = ({inviteId}, {peerId}) => {
     if (invite !== current || inviteId !== id || !current.pending.has(peerId)) return;
+    const addedId = current.pending.get(peerId);
     current.pending.delete(peerId); current.admitted.add(peerId);
+    if (!mesh.getPeers()[peerId] && !fastLinks.has(peerId)) fastLinks.set(peerId,{invite:current,chat:fastChat,memberId:addedId,name:members.get(addedId)?.name});
+    logEvent(fastLinks.get(peerId)?.name || members.get(peerMembers.get(peerId))?.name || 'A member','joined');
+    renderPeers();
+    $('pipeline').textContent = 'Chat ready · connecting private mesh';
+    const recent = [...messages.values()].filter(item => item.kind !== 'event').sort((a,b) => b.time-a.time).slice(0,30);
+    if (recent.length) void fastHistory.send(recent,{target:peerId}).catch(() => {});
     if (!current.multi) closeInvite();
     else $('invite-status').textContent = 'Invite open. ' + current.admitted.size + ' joined.';
   };
@@ -418,8 +501,10 @@ async function handleInvitePeer(current, peerId, identity) {
   try {
     await grantPeer(identity.id,identity.key,identity.name);
     if (invite !== current || (!current.open && current.claimed !== peerId)) { revokeMember(identity.id); return; }
-    await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, members:[...members]}, {target:peerId});
+    await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, hostName:localName, members:[...members]}, {target:peerId});
+    if (invite === current && members.has(identity.id)) fastLinks.set(peerId,{invite:current,chat:current.fastChat,memberId:identity.id,name:identity.name});
   } catch {
+    fastLinks.delete(peerId);
     current.pending.delete(peerId);
     if (!current.multi) closeInvite();
     revokeMember(identity.id);
@@ -439,7 +524,7 @@ function parseInvite(raw) {
 function prepareJoin(raw) {
   const data = parseInvite(raw);
   if (joinAttempt) cancelJoin();
-  joinAttempt = {data, room:null, timer:null, ready:false};
+  joinAttempt = {data, room:null, timer:null, ready:false, startedAt:performance.now()};
   $('join-room-name').textContent = data.roomName;
   $('join-description').textContent = 'Invited to ' + data.roomName;
   if ($('scanner').open) $('scanner').close();
@@ -458,7 +543,7 @@ function beginJoin() {
   if (!localName) return;
   newSessionSlot();
   memberId = token(12); memberKey = token();
-  show('joining'); $('joining-text').textContent = 'Joining ' + current.data.roomName + '...';
+  show('joining'); $('joining-text').textContent = 'Name received · admitting you to ' + current.data.roomName + '...';
   clearTimeout(current.timer);
   current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Admission timed out. Ask for a new invite.',true); } },10000);
   void current.request.send({id:memberId,key:memberKey,name:localName},{target:current.data.host}).catch(() => {
@@ -466,7 +551,7 @@ function beginJoin() {
   });
 }
 function startInviteConnection(current) {
-  show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...'; notice('');
+  show('joining'); $('joining-text').textContent = 'Finding inviter for ' + current.data.roomName + '...'; notice('');
   const room = joinRoom(configFor(current.data.appId,current.data.secret), 'invite-' + current.data.id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
       if (peerId !== current.data.host || joinAttempt !== current) throw new Error('Unexpected inviter');
@@ -486,20 +571,30 @@ function startInviteConnection(current) {
   });
   current.room = room;
   const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request'), ready = room.makeAction('ready');
+  const fastChat = room.makeAction('fast-chat'), fastHistory = room.makeAction('fast-history');
   current.request = request;
+  fastChat.onMessage = (item,{peerId}) => {
+    if (fastGuest?.room === room && peerId === current.data.host) recordMessage(item);
+  };
+  fastHistory.onMessage = (items,{peerId}) => {
+    if (fastGuest?.room === room && peerId === current.data.host && Array.isArray(items) && items.length <= 30) items.forEach(recordMessage);
+  };
   room.onPeerJoin = peerId => {
     if (peerId !== current.data.host || joinAttempt !== current) return;
-    $('joining-text').textContent = 'Verifying invite for ' + current.data.roomName + '...';
+    $('joining-text').textContent = 'Inviter found · verifying QR secret...';
   };
   ready.onMessage = ({inviteId}, {peerId}) => {
     if (joinAttempt !== current || peerId !== current.data.host || inviteId !== current.data.id) return;
     current.ready = true;
     clearTimeout(current.timer);
+    $('join-description').textContent = 'Invite verified. Enter your name to join ' + current.data.roomName + '.';
     show('join-setup'); $('join-name').focus();
   };
   room.onPeerLeave = peerId => {
     if (joinAttempt === current && !current.admitted && peerId === current.data.host) {
       cancelJoin(); notice('The inviter disconnected. Ask for a new code.',true);
+    } else if (fastGuest?.room === room && peerId === current.data.host) {
+      fastGuest = null; renderPeers(); $('pipeline').textContent = 'Private mesh connecting';
     }
   };
   admit.onMessage = async (data, {peerId}) => {
@@ -513,16 +608,24 @@ function startInviteConnection(current) {
     if (roster.get(memberId)?.key !== memberKey) return;
     clearTimeout(current.timer);
     current.admitted = true;
+    if (normalizeName(data.hostName,24)) names.set(peerId,data.hostName);
+    logEvent(names.get(peerId) || 'Inviter','joined');
     members.clear(); for (const [id,member] of roster) members.set(id,member);
-    sessionAppId = current.data.appId; roomName = data.roomName; openMesh(data.meshId, data.meshKey);
+    fastGuest = {room,peerId,chat:fastChat};
+    sessionAppId = current.data.appId; roomName = data.roomName;
     await ack.send({inviteId:current.data.id}, {target:peerId}).catch(() => {});
-    setTimeout(() => { room.leave(); if (joinAttempt === current) joinAttempt = null; }, 500);
+    openMesh(data.meshId, data.meshKey);
+    $('pipeline').textContent = 'Chat ready in ' + ((performance.now()-current.startedAt)/1000).toFixed(1) + 's · connecting private mesh';
+    current.timer = setTimeout(() => { if (joinAttempt === current) joinAttempt = null; }, 30000);
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
   current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('The inviter could not be reached. The code may be closed, or the signaling relay may be slow. Ask for a fresh invite.', true); } }, 12000);
 }
 async function leaveRoom() {
   closeInvite(); cancelJoin();
+  for (const active of inviteRooms) active.room.leave();
+  inviteRooms.clear(); fastLinks.clear();
+  if (fastGuest) { fastGuest.room.leave(); fastGuest = null; }
   if (mesh && memberId) {
     try { await mesh.actions.revokeAction.send({id:memberId}); } catch {}
   }
@@ -567,7 +670,7 @@ async function scanValue(value, points) {
   if (scanBusy) return;
   scanBusy = true;
   try {
-    if (points) { outline(points); $('scanner-note').textContent = 'QR found.'; await new Promise(resolve => setTimeout(resolve,350)); }
+    if (points) { outline(points); $('scanner-note').textContent = 'QR found.'; }
     prepareJoin(value);
   } catch (error) { $('scanner-note').textContent = error.message; }
   finally { scanBusy = false; }
@@ -592,7 +695,7 @@ async function openScanner() {
     let last = 0;
     async function tick(now) {
       if (run !== scannerRun || !$('scanner').open) return;
-      if (now-last > 160 && video.videoWidth) {
+      if (now-last > 90 && video.videoWidth) {
         last = now;
         let found;
         if (detector) { try { const code = (await detector.detect(video))[0]; if (code) found = {data:code.rawValue,points:code.cornerPoints}; } catch { detector = null; } }
@@ -646,12 +749,12 @@ $('invite-dialog').addEventListener('cancel',event => { event.preventDefault(); 
 $('copy-invite').onclick = async () => { try { await navigator.clipboard.writeText($('invite-link').textContent); notice('Invite link copied.'); } catch { $('invite-link').hidden = false; } };
 $('leave').onclick = () => void leaveRoom();
 $('composer').onsubmit = event => {
-  event.preventDefault(); const text = $('message').value.trim(); if (!text || !mesh || !Object.keys(mesh.getPeers()).length) return;
+  event.preventDefault(); const text = $('message').value.trim(); if (!text || !mesh || !(Object.keys(mesh.getPeers()).length || fastLinks.size || fastGuest)) return;
   const item = {kind:'chat',id:token(),from:selfId,name:localName,text,time:Date.now()};
-  recordMessage(item); void mesh.actions.chatAction.send(item).catch(() => notice('Message could not be sent.',true));
+  recordMessage(item); sendChat(item);
   $('message').value = ''; $('message').focus();
 };
-window.addEventListener('pagehide',() => { closeInvite(); joinAttempt?.room?.leave(); mesh?.leave(); stopScanner(); });
+window.addEventListener('pagehide',() => { closeInvite(); for (const active of inviteRooms) active.room.leave(); joinAttempt?.room?.leave(); fastGuest?.room.leave(); mesh?.leave(); stopScanner(); });
 if (!window.qrcode || !window.jsQR) {
   notice('QR libraries could not load. Check your connection and reload.',true);
   $('invite-start').disabled = true; $('join-start').disabled = true;
