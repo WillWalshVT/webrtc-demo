@@ -60,7 +60,7 @@ input:focus,textarea:focus{outline:2px solid #157d78;outline-offset:1px}
 .pair-panel h2{margin-bottom:8px}
 .pair-panel p{line-height:1.5}
 .qr{display:grid;place-items:center;background:#fff;margin:12px 0;min-height:200px}
-.qr svg{display:block;width:min(100%,680px);height:auto}
+.qr svg{display:block;width:min(100%,680px);height:auto;shape-rendering:crispEdges}
 .link-line{font-size:13px;overflow-wrap:anywhere;color:#365761;margin:12px 0}
 .small{font-size:13px}
 dialog{border:1px solid #cbd6d4;border-radius:6px;box-shadow:0 16px 48px #162d322e;padding:0;width:min(94vw,520px);max-height:90vh;color:#17262b}
@@ -118,7 +118,7 @@ const members = new Map();
 const seen = new Set();
 const pendingCandidates = new Map();
 const chatHistory = new Map();
-let localId, localName, roomId, roomName, pendingInvite, pendingJoin, inviteLink, answerCode;
+let localId, localName, roomId, roomName, pendingInvite, pendingJoin, inviteLink, answerCode, inviteTimer;
 let scanStream, scanFrame, scanKind, scanLast = 0, barcodeDetector, scanAttempts = 0, scanBusy = false;
 let scannerRun = 0, entryMode = null;
 const scanCanvas = document.createElement('canvas');
@@ -289,6 +289,7 @@ function attach(peer, dc) {
     if (peer.id) { rememberMember(peer.id, peer.name); announce({id:peer.id, name:peer.name}); }
     if (pendingInvite?.peer === peer) {
       startHistory(peer);
+      clearTimeout(inviteTimer);
       pendingInvite = null;
       $('invite-dialog').close(); $('scan-answer').hidden = true;
     }
@@ -443,6 +444,7 @@ function renderMessages() {
   list.scrollTop = atBottom ? list.scrollHeight : oldTop + list.scrollHeight - oldHeight;
 }
 function resetRoom() {
+  clearTimeout(inviteTimer);
   for (const peer of peers.values()) { clearTimeout(peer.failureTimer); peer.pc.close(); }
   if (pendingInvite) pendingInvite.peer.pc.close();
   peers.clear(); members.clear(); seen.clear(); pendingCandidates.clear(); chatHistory.clear();
@@ -455,7 +457,7 @@ function resetRoom() {
   show('entry');
 }
 async function createInvite() {
-  if (pendingInvite) { if (!$('invite-dialog').open) $('invite-dialog').showModal(); return; }
+  if (pendingInvite) cancelInvite();
   const peer = newPeer(null, '', true);
   const nonce = makeId();
   pendingInvite = {peer, nonce};
@@ -469,7 +471,9 @@ async function createInvite() {
     await peer.pc.setLocalDescription(await peer.pc.createOffer());
     await gatherForQr(peer.pc);
     if (pendingInvite?.peer !== peer) return;
-    const offer = {v:1, kind:'offer', room:roomId, roomName, expires:Date.now()+300000, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
+    const expires = Date.now()+300000;
+    const offer = {v:1, kind:'offer', room:roomId, roomName, expires, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
+    pendingInvite.expires = expires;
     const token = encode(offer);
     inviteLink = APP_URL + '#invite=' + token;
     try { qr(inviteLink, $('invite-qr')); }
@@ -477,16 +481,18 @@ async function createInvite() {
     $('invite-copy').textContent = inviteLink;
     $('scan-answer').hidden = false;
     $('copy-invite').disabled = false;
+    inviteTimer = setTimeout(() => { if (pendingInvite?.peer === peer && !pendingInvite.accepted) void createInvite(); }, 240000);
   } catch (error) { dropPeer(peer); notice('Could not create invite: ' + error.message, true); }
   finally { $('add-client').disabled = false; }
 }
 function cancelInvite() {
+  clearTimeout(inviteTimer);
   const invite = pendingInvite;
   pendingInvite = null; inviteLink = null;
   if (invite) invite.peer.pc.close();
   $('invite-dialog').close(); $('scan-answer').hidden = true;
 }
-async function joinOffer(raw) {
+async function joinOffer(raw, onAccepted) {
   const name = nameFromInput();
   if (!name) return;
   let token = raw.trim();
@@ -495,6 +501,7 @@ async function joinOffer(raw) {
   const offer = decode(token);
   if (offer.v !== 1 || offer.kind !== 'offer' || !isId(offer.room) || !isRoomName(offer.roomName) || !isId(offer.nonce) || !isId(offer.from?.id) || !isName(offer.from?.name) || offer.description?.type !== 'offer' || typeof offer.description.sdp !== 'string' || offer.description.sdp.length > 50000) throw new Error('This is not a valid mesh invite.');
   if (!Number.isFinite(offer.expires) || Date.now() > offer.expires) throw new Error('This invite has expired. Scan a new code.');
+  onAccepted?.();
   clearPrefill();
   localId = makeId(); localName = name; roomId = offer.room; roomName = offer.roomName.trim();
   $('room-title').textContent = roomName;
@@ -523,6 +530,7 @@ async function acceptAnswer(raw) {
   const peer = pendingInvite.peer;
   if (peers.has(answer.from.id)) throw new Error('This client is already connected.');
   peer.id = answer.from.id; peer.name = answer.from.name;
+  pendingInvite.accepted = true;
   peers.set(peer.id, peer);
   rememberMember(peer.id, peer.name);
   await peer.pc.setRemoteDescription(answer.description);
@@ -553,11 +561,15 @@ async function useCode(raw) {
   if (scanBusy) return false;
   scanBusy = true;
   try {
-    if (scanKind === 'invite') await joinOffer(raw);
+    if (scanKind === 'invite') await joinOffer(raw, () => $('scanner').close());
     else await acceptAnswer(raw);
-    $('scanner').close();
+    if ($('scanner').open) $('scanner').close();
     return true;
-  } catch (error) { $('scanner-note').textContent = error.message; return false; }
+  } catch (error) {
+    if ($('scanner').open) $('scanner-note').textContent = error.message;
+    else notice(error.message, true);
+    return false;
+  }
   finally { scanBusy = false; }
 }
 async function openScanner(kind) {
@@ -675,6 +687,9 @@ $('leave').onclick = () => {
   const message = {kind:'leave', id:makeId(), room:roomId, from:localId, hops:16};
   rememberEnvelope(message.id); flood(message); resetRoom();
 };
+window.addEventListener('focus', () => {
+  if (pendingInvite?.expires && !pendingInvite.accepted && Date.now() > pendingInvite.expires - 30000) void createInvite();
+});
 window.addEventListener('pagehide', () => {
   if (localId && roomId) {
     const message = {kind:'leave', id:makeId(), room:roomId, from:localId, hops:16};
@@ -695,6 +710,7 @@ if (!window.qrcode || !window.jsQR || !window.pako) {
     if (!isRoomName(offer.roomName) || !Number.isFinite(offer.expires) || Date.now() > offer.expires) throw new Error('Invite expired. Scan a new code.');
     $('prefill').textContent = 'Invite to ' + offer.roomName.trim() + ' from ' + offer.from.name + '. Enter your name and select Join.';
     $('prefill').dataset.code = code;
+    setEntryMode('join');
   } catch (error) { clearPrefill(); notice(error.message, true); }
   window.history.replaceState(null, '', APP_URL);
 }
