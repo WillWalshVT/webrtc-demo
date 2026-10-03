@@ -475,7 +475,7 @@ async function createInvite() {
     const offer = {v:1, kind:'offer', room:roomId, roomName, expires, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
     pendingInvite.expires = expires;
     const token = encode(offer);
-    inviteLink = APP_URL + '#invite=' + token;
+    inviteLink = APP_URL + '?pair=' + nonce + '#invite=' + token;
     try { qr(inviteLink, $('invite-qr')); }
     catch { qr('MESH1:' + token, $('invite-qr')); $('invite-note').textContent = 'This QR opens inside the chat page. On a phone, open the page and select Join, or use Copy invite link.'; }
     $('invite-copy').textContent = inviteLink;
@@ -708,7 +708,7 @@ if (!window.qrcode || !window.jsQR || !window.pako) {
     const code = location.hash.slice(8);
     const offer = decode(code);
     if (!isRoomName(offer.roomName) || !Number.isFinite(offer.expires) || Date.now() > offer.expires) throw new Error('Invite expired. Scan a new code.');
-    $('prefill').textContent = 'Invite to ' + offer.roomName.trim() + ' from ' + offer.from.name + '. Enter your name and select Join.';
+    $('prefill').textContent = 'Invite to ' + offer.roomName.trim() + ' from ' + offer.from.name + '. Enter your name to continue.';
     $('prefill').dataset.code = code;
     setEntryMode('join');
   } catch (error) { clearPrefill(); notice(error.message, true); }
