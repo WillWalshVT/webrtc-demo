@@ -47,6 +47,8 @@ input:focus,textarea:focus{outline:2px solid #16837a;outline-offset:1px}
 .message .meta{font-size:12px;color:#687b7d;margin-bottom:3px}
 .message.mine .meta{color:#126c68}
 .message p{margin:0}
+.message.event{font-size:12px;color:#687b7d;padding:2px 0}
+.message.event time{margin-left:7px;color:#829193}
 .composer{display:flex;gap:8px;padding:12px;border-top:1px solid #d5dfdd}
 .composer input{flex:1}
 .peers{border-top:1px solid #d5dfdd;padding-top:16px}
@@ -127,8 +129,9 @@ try {
 const $ = id => document.getElementById(id);
 const APP_URL = location.origin + location.pathname;
 const configFor = (appId, password) => ({appId, password, rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
-const names = new Map(), messages = new Map(), allowed = new Set(), grantWaiters = new Map();
-let mesh, meshId, meshKey, sessionAppId, localName, roomName, invite, joinAttempt, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
+const STORAGE_KEY = 'webrtc-signal-chat-session-v3';
+const names = new Map(), messages = new Map(), members = new Map(), peerMembers = new Map();
+let mesh, meshId, meshKey, sessionAppId, memberId, memberKey, localName, roomName, invite, joinAttempt, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
@@ -171,18 +174,66 @@ async function secureHandshake(secret, context, peerId, send, receive, isInitiat
     if (!await verifyProof(key,label + 'finish|' + data.nonce + '|' + second,response.data?.proof)) throw new Error('Invalid access proof.');
   }
 }
+async function memberHandshake(peerId, send, receive, isInitiator) {
+  const context = 'mesh-' + meshId + '|' + [selfId,peerId].sort().join(':') + '|';
+  if (isInitiator) {
+    const first = token();
+    await send({id:memberId,nonce:first});
+    const {data} = await receive();
+    const remote = members.get(data?.id);
+    if (!remote || !/^[A-Za-z0-9_-]{24}$/.test(data.nonce) ||
+        !await verifyProof(await proofKey(remote.key),context + 'reply|' + first + '|' + data.nonce,data.proof)) throw new Error('Member not admitted.');
+    await send({proof:await signProof(await proofKey(memberKey),context + 'finish|' + first + '|' + data.nonce)});
+    peerMembers.set(peerId,data.id);
+  } else {
+    const {data} = await receive();
+    const remote = members.get(data?.id);
+    if (!remote || !/^[A-Za-z0-9_-]{24}$/.test(data.nonce)) throw new Error('Member not admitted.');
+    const second = token();
+    await send({id:memberId,nonce:second,proof:await signProof(await proofKey(memberKey),context + 'reply|' + data.nonce + '|' + second)});
+    const response = await receive();
+    if (!await verifyProof(await proofKey(remote.key),context + 'finish|' + data.nonce + '|' + second,response.data?.proof)) throw new Error('Member not admitted.');
+    peerMembers.set(peerId,data.id);
+  }
+}
 function encode(data) { return btoa(unescape(encodeURIComponent(JSON.stringify(data)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
 function decode(value) {
   if (typeof value !== 'string' || value.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('Invalid invite code.');
   return JSON.parse(decodeURIComponent(escape(atob(value.replace(/-/g,'+').replace(/_/g,'/')))));
 }
-function normalizeName(value, limit) { const name = value.trim(); return name && name.length <= limit ? name : null; }
+function normalizeName(value, limit) { const name = typeof value === 'string' ? value.trim() : ''; return name && name.length <= limit ? name : null; }
+function validToken(value, length = 24) { return typeof value === 'string' && new RegExp('^[A-Za-z0-9_-]{' + length + '}$').test(value); }
+function saveSession() {
+  if (!mesh || !memberId) return;
+  try {
+    localStorage.setItem(STORAGE_KEY,JSON.stringify({v:3,appId:sessionAppId,meshId,meshKey,memberId,memberKey,localName,roomName,members:[...members],messages:[...messages.values()]}));
+  } catch { notice('This browser cannot save the session. Refresh will require a new invite.',true); }
+}
+function clearSavedSession() { try { localStorage.removeItem(STORAGE_KEY); } catch {} }
+function restoreSession() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'); } catch { return false; }
+  if (saved?.v !== 3 || !validToken(saved.appId) || !validToken(saved.meshId) || !validToken(saved.meshKey) ||
+      !validToken(saved.memberId,16) || !validToken(saved.memberKey) || !normalizeName(saved.localName,24) ||
+      !normalizeName(saved.roomName,48) || !Array.isArray(saved.members) || saved.members.length > 1000) return false;
+  const restored = new Map();
+  for (const entry of saved.members) {
+    if (!Array.isArray(entry) || !validToken(entry[0],16) || !validToken(entry[1]?.key) || !normalizeName(entry[1]?.name || '',24)) return false;
+    restored.set(entry[0],entry[1]);
+  }
+  if (restored.get(saved.memberId)?.key !== saved.memberKey) return false;
+  ({appId:sessionAppId,meshId,meshKey,memberId,memberKey,localName,roomName} = saved);
+  members.clear(); for (const [id,member] of restored) members.set(id,member);
+  messages.clear(); if (Array.isArray(saved.messages)) saved.messages.slice(-500).forEach(item => recordMessage(item));
+  openMesh(meshId,meshKey);
+  return true;
+}
 function show(section) { for (const id of ['home','host-setup','join-setup','joining','room']) $(id).hidden = id !== section; }
 function notice(message, error = false) { $('notice').textContent = message; $('notice').classList.toggle('error', error); $('notice').hidden = !message; }
 function renderPeers() {
   const list = $('peer-list'); list.textContent = '';
   const peers = mesh ? Object.keys(mesh.getPeers()) : [];
-  for (const [id, name] of [[selfId, localName], ...peers.map(id => [id, names.get(id) || 'Connecting'])]) {
+  for (const [id, name] of [[selfId, localName], ...peers.map(id => [id, names.get(id) || members.get(peerMembers.get(id))?.name || 'Connecting'])]) {
     const li = document.createElement('li');
     const dot = document.createElement('span'); dot.className = 'dot';
     const label = document.createElement('span'); label.className = 'name'; label.textContent = name;
@@ -196,84 +247,84 @@ function renderPeers() {
   $('composer').querySelector('button').disabled = !peers.length;
 }
 function recordMessage(item) {
-  if (!item || typeof item.id !== 'string' || item.id.length > 80 || typeof item.text !== 'string' || item.text.length > 2000 || typeof item.name !== 'string' || item.name.length > 24 || !Number.isFinite(item.time) || messages.has(item.id)) return false;
+  if (!item || typeof item.id !== 'string' || item.id.length > 80 || !['chat','event'].includes(item.kind || 'chat') ||
+      typeof item.text !== 'string' || item.text.length > 2000 || typeof item.name !== 'string' || item.name.length > 24 ||
+      !Number.isFinite(item.time) || messages.has(item.id)) return false;
   messages.set(item.id, item);
   if (messages.size > 500) messages.delete(messages.keys().next().value);
-  renderMessages(); return true;
+  renderMessages(); saveSession(); return true;
+}
+function logEvent(name, verb) {
+  if (!name) return;
+  recordMessage({kind:'event',id:token(),name,text:name + ' ' + verb,time:Date.now()});
 }
 function renderMessages() {
   const list = $('messages'); const bottom = list.scrollHeight-list.scrollTop-list.clientHeight < 70;
   list.textContent = '';
   if (!messages.size) { const p = document.createElement('p'); p.className = 'empty'; p.textContent = 'Messages will appear here.'; list.append(p); }
   for (const item of [...messages.values()].sort((a,b) => a.time-b.time || a.id.localeCompare(b.id))) {
-    const entry = document.createElement('div'); entry.className = 'message' + (item.from === selfId ? ' mine' : '');
+    const entry = document.createElement('div'); entry.className = 'message' + (item.kind === 'event' ? ' event' : item.from === selfId ? ' mine' : '');
+    if (item.kind === 'event') {
+      entry.append(document.createTextNode(item.text));
+      const time = document.createElement('time'); time.dateTime = new Date(item.time).toISOString();
+      time.textContent = new Date(item.time).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});
+      entry.append(time); list.append(entry); continue;
+    }
     const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = item.name;
     const body = document.createElement('p'); body.textContent = item.text;
     entry.append(meta, body); list.append(entry);
   }
   if (bottom) list.scrollTop = list.scrollHeight;
 }
-function resolveGrant(id, peerId) {
-  const waiter = grantWaiters.get(id); if (!waiter) return;
-  waiter.remaining.delete(peerId);
-  if (!waiter.remaining.size) { clearTimeout(waiter.timer); grantWaiters.delete(id); waiter.resolve(); }
-}
 function openMesh(id, key, knownPeers = []) {
-  meshId = id; meshKey = key; knownPeers.forEach(peerId => allowed.add(peerId));
+  meshId = id; meshKey = key;
   mesh = joinRoom(configFor(sessionAppId,key), 'mesh-' + id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
-      if (!allowed.has(peerId)) throw new Error('Not admitted to this room');
-      await secureHandshake(meshKey,'mesh-' + meshId,peerId,send,receive,isInitiator);
-      if (!allowed.has(peerId)) throw new Error('Admission revoked');
+      await memberHandshake(peerId,send,receive,isInitiator);
+      if (!members.has(peerMembers.get(peerId))) throw new Error('Admission revoked');
     },
-    onJoinError: details => { if (details.peerId && allowed.has(details.peerId)) notice('Could not connect to a peer. This network may require a relay.', true); }
+    onJoinError: details => { if (details.peerId && members.has(peerMembers.get(details.peerId))) notice('Could not connect to a peer. This network may require a relay.', true); }
   });
   const nameAction = mesh.makeAction('name');
   const chatAction = mesh.makeAction('chat');
   const historyAction = mesh.makeAction('history');
   const grantAction = mesh.makeAction('grant');
-  const ackAction = mesh.makeAction('gack');
   const revokeAction = mesh.makeAction('revoke');
-  mesh.actions = {nameAction, chatAction, historyAction, grantAction, ackAction, revokeAction};
+  mesh.actions = {nameAction, chatAction, historyAction, grantAction, revokeAction};
   nameAction.onMessage = (name, {peerId}) => { if (typeof name === 'string' && name.length <= 24 && name.trim()) { names.set(peerId, name.trim()); renderPeers(); } };
   chatAction.onMessage = (item, {peerId}) => { if (item?.from === peerId) recordMessage(item); };
   historyAction.onMessage = items => { if (Array.isArray(items) && items.length <= 30) items.forEach(recordMessage); };
-  grantAction.onMessage = ({id:peerId, requestId}, {peerId:grantor}) => {
-    if (typeof peerId !== 'string' || peerId.length > 100 || typeof requestId !== 'string') return;
-    allowed.add(peerId);
-    void ackAction.send({requestId}, {target:grantor}).catch(() => {});
+  grantAction.onMessage = ({id:addedId, key:addedKey, name}) => {
+    if (!validToken(addedId,16) || !validToken(addedKey) || !normalizeName(name || '',24)) return;
+    members.set(addedId,{key:addedKey,name}); saveSession();
   };
-  ackAction.onMessage = ({requestId}, {peerId}) => resolveGrant(requestId, peerId);
-  revokeAction.onMessage = ({id:peerId}) => { if (typeof peerId === 'string') allowed.delete(peerId); };
+  revokeAction.onMessage = ({id:removedId}) => { if (validToken(removedId,16)) { members.delete(removedId); saveSession(); } };
   mesh.onPeerJoin = peerId => {
-    allowed.add(peerId);
+    const name = members.get(peerMembers.get(peerId))?.name;
+    logEvent(name || 'A member','joined');
     renderPeers();
     void nameAction.send(localName, {target:peerId}).catch(() => {});
-    const recent = [...messages.values()].sort((a,b) => b.time-a.time).slice(0,30);
+    const recent = [...messages.values()].filter(item => item.kind !== 'event').sort((a,b) => b.time-a.time).slice(0,30);
     if (recent.length) void historyAction.send(recent, {target:peerId}).catch(() => {});
   };
-  mesh.onPeerLeave = peerId => { allowed.delete(peerId); names.delete(peerId); renderPeers(); };
+  mesh.onPeerLeave = peerId => {
+    const name = names.get(peerId) || members.get(peerMembers.get(peerId))?.name || 'A member';
+    logEvent(name,'left'); names.delete(peerId); peerMembers.delete(peerId); renderPeers();
+  };
   $('room-title').textContent = roomName;
-  renderPeers(); show('room');
+  renderPeers(); show('room'); saveSession();
 }
-async function grantPeer(peerId) {
-  allowed.add(peerId);
+async function grantPeer(id, key, name) {
+  members.set(id,{key,name}); saveSession();
   const others = Object.keys(mesh.getPeers());
   if (!others.length) return;
-  const requestId = token();
-  const done = new Promise((resolve,reject) => {
-    const remaining = new Set(others);
-    const timer = setTimeout(() => { grantWaiters.delete(requestId); reject(new Error('Room members did not acknowledge the new client.')); }, 6000);
-    grantWaiters.set(requestId, {remaining, timer, resolve});
-  });
   try {
-    await mesh.actions.grantAction.send({id:peerId, requestId}, {target:others});
-    await done;
-  } catch (error) { revokePeer(peerId); throw error; }
+    await mesh.actions.grantAction.send({id,key,name}, {target:others});
+  } catch (error) { revokeMember(id); throw error; }
 }
-function revokePeer(peerId) {
-  allowed.delete(peerId);
-  if (mesh) void mesh.actions.revokeAction.send({id:peerId}).catch(() => {});
+function revokeMember(id) {
+  members.delete(id); saveSession();
+  if (mesh) void mesh.actions.revokeAction.send({id}).catch(() => {});
 }
 function closeInvite() {
   const active = invite; invite = null;
@@ -282,7 +333,7 @@ function closeInvite() {
   if (!active) return;
   clearTimeout(active.timer);
   active.open = false;
-  for (const peerId of active.pending) revokePeer(peerId);
+  for (const addedId of active.pending.values()) revokeMember(addedId);
   active.room.leave();
 }
 function hideSingleUseInvite(current) {
@@ -309,10 +360,10 @@ function createInvite(multi) {
     },
     onJoinError:() => {}
   });
-  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny');
-  const current = {id, room, admit, ack, deny, multi, expires, open:true, claimed:null, pending:new Set(), admitted:new Set(), timer:null};
+  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request');
+  const current = {id, room, admit, ack, deny, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null};
   invite = current;
-  room.onPeerJoin = peerId => void handleInvitePeer(current, peerId);
+  request.onMessage = (identity, {peerId}) => void handleInvitePeer(current,peerId,identity);
   ack.onMessage = ({inviteId}, {peerId}) => {
     if (invite !== current || inviteId !== id || !current.pending.has(peerId)) return;
     current.pending.delete(peerId); current.admitted.add(peerId);
@@ -328,22 +379,24 @@ function createInvite(multi) {
   $('invite-dialog').showModal();
   current.timer = setTimeout(() => { if (invite === current) closeInvite(); }, 300000);
 }
-async function handleInvitePeer(current, peerId) {
+async function handleInvitePeer(current, peerId, identity) {
   if (invite !== current || Date.now() > current.expires || (!current.open && current.claimed !== peerId)) {
     await current.deny.send('This invite is closed.', {target:peerId}).catch(() => {}); return;
   }
+  if (!validToken(identity?.id,16) || !validToken(identity?.key) || !normalizeName(identity?.name || '',24) || members.has(identity.id)) {
+    await current.deny.send('Invalid member credentials.', {target:peerId}).catch(() => {}); return;
+  }
   if (current.pending.has(peerId) || current.admitted.has(peerId)) return;
   if (!current.multi) current.claimed = peerId;
-  current.pending.add(peerId);
+  current.pending.set(peerId,identity.id);
   try {
-    await grantPeer(peerId);
-    if (invite !== current || (!current.open && current.claimed !== peerId)) { revokePeer(peerId); return; }
-    const peers = [selfId, ...Object.keys(mesh.getPeers())];
-    await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, peers}, {target:peerId});
+    await grantPeer(identity.id,identity.key,identity.name);
+    if (invite !== current || (!current.open && current.claimed !== peerId)) { revokeMember(identity.id); return; }
+    await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, members:[...members]}, {target:peerId});
   } catch {
     current.pending.delete(peerId);
     if (!current.multi) closeInvite();
-    revokePeer(peerId);
+    revokeMember(identity.id);
     await current.deny.send('Could not prepare this connection. Try again.', {target:peerId}).catch(() => {});
   }
 }
@@ -377,6 +430,7 @@ function beginJoin() {
   if (!current || Date.now() > current.data.expires) { cancelJoin(); notice('Invite expired. Scan a new code.', true); return; }
   localName = normalizeName($('join-name').value,24);
   if (!localName) return;
+  memberId = token(12); memberKey = token();
   const room = joinRoom(configFor(current.data.appId,current.data.secret), 'invite-' + current.data.id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
       if (peerId !== current.data.host || joinAttempt !== current) throw new Error('Unexpected inviter');
@@ -385,29 +439,47 @@ function beginJoin() {
     },
     onJoinError:details => {
       if (details.peerId === current.data.host && joinAttempt === current) {
-        cancelJoin(); notice('Invite closed or access denied. Ask for a new code.',true);
+        cancelJoin(); notice('Invite unavailable or connection failed. Ask for a new code, or try again.',true);
       }
     }
   });
   current.room = room;
-  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny');
+  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request');
+  room.onPeerJoin = peerId => {
+    if (peerId !== current.data.host || joinAttempt !== current) return;
+    $('joining-text').textContent = 'Joining ' + current.data.roomName + '...';
+    clearTimeout(current.timer);
+    current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Admission timed out. Ask for a new invite.',true); } },10000);
+    void request.send({id:memberId,key:memberKey,name:localName},{target:peerId}).catch(() => {});
+  };
   admit.onMessage = async (data, {peerId}) => {
-    if (peerId !== current.data.host || joinAttempt !== current || data?.inviteId !== current.data.id || typeof data.meshId !== 'string' || !Array.isArray(data.peers)) return;
+    if (peerId !== current.data.host || joinAttempt !== current || data?.inviteId !== current.data.id || typeof data.meshId !== 'string' || !Array.isArray(data.members)) return;
     clearTimeout(current.timer);
     if (!/^[A-Za-z0-9_-]{24}$/.test(data.meshId) || !/^[A-Za-z0-9_-]{24}$/.test(data.meshKey)) return;
-    sessionAppId = current.data.appId; roomName = data.roomName; openMesh(data.meshId, data.meshKey, data.peers);
+    const roster = new Map();
+    for (const entry of data.members) {
+      if (!Array.isArray(entry) || !validToken(entry[0],16) || !validToken(entry[1]?.key) || !normalizeName(entry[1]?.name || '',24)) return;
+      roster.set(entry[0],entry[1]);
+    }
+    if (roster.get(memberId)?.key !== memberKey) return;
+    members.clear(); for (const [id,member] of roster) members.set(id,member);
+    sessionAppId = current.data.appId; roomName = data.roomName; openMesh(data.meshId, data.meshKey);
     await ack.send({inviteId:current.data.id}, {target:peerId}).catch(() => {});
     setTimeout(() => { room.leave(); if (joinAttempt === current) joinAttempt = null; }, 500);
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
-  show('joining'); $('joining-text').textContent = 'Waiting for ' + current.data.roomName + ' to admit you.';
-  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Invite unavailable. Ask for a new code.', true); } }, 30000);
+  show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...';
+  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Invite unavailable. Ask for a new code.', true); } }, 12000);
 }
-function leaveRoom() {
+async function leaveRoom() {
   closeInvite(); cancelJoin();
+  if (mesh && memberId) {
+    try { await mesh.actions.revokeAction.send({id:memberId}); } catch {}
+  }
+  clearSavedSession();
   if (mesh) mesh.leave();
-  mesh = null; meshId = null; meshKey = null; sessionAppId = null; localName = null; roomName = null;
-  names.clear(); messages.clear(); allowed.clear(); renderMessages();
+  mesh = null; meshId = null; meshKey = null; sessionAppId = null; memberId = null; memberKey = null; localName = null; roomName = null;
+  names.clear(); messages.clear(); members.clear(); peerMembers.clear(); renderMessages();
   show('home'); notice('');
 }
 
@@ -510,7 +582,9 @@ $('host-form').onsubmit = event => {
   event.preventDefault();
   const name = normalizeName($('host-name').value,24), title = normalizeName($('room-name').value,48);
   if (!name || !title) return;
-  localName = name; roomName = title; sessionAppId = token(); openMesh(token(),token());
+  localName = name; roomName = title; sessionAppId = token(); memberId = token(12); memberKey = token();
+  members.clear(); members.set(memberId,{key:memberKey,name:localName});
+  openMesh(token(),token());
   createInvite($('first-multi').checked);
 };
 $('join-form').onsubmit = event => { event.preventDefault(); beginJoin(); };
@@ -519,10 +593,10 @@ $('show-invite').onclick = () => createInvite($('invite-multi').checked);
 $('close-invite').onclick = closeInvite;
 $('invite-dialog').addEventListener('cancel',event => { event.preventDefault(); closeInvite(); });
 $('copy-invite').onclick = async () => { try { await navigator.clipboard.writeText($('invite-link').textContent); notice('Invite link copied.'); } catch { $('invite-link').hidden = false; } };
-$('leave').onclick = leaveRoom;
+$('leave').onclick = () => void leaveRoom();
 $('composer').onsubmit = event => {
   event.preventDefault(); const text = $('message').value.trim(); if (!text || !mesh || !Object.keys(mesh.getPeers()).length) return;
-  const item = {id:token(),from:selfId,name:localName,text,time:Date.now()};
+  const item = {kind:'chat',id:token(),from:selfId,name:localName,text,time:Date.now()};
   recordMessage(item); void mesh.actions.chatAction.send(item).catch(() => notice('Message could not be sent.',true));
   $('message').value = ''; $('message').focus();
 };
@@ -534,7 +608,7 @@ if (!window.qrcode || !window.jsQR) {
   try { prepareJoin(location.hash.slice(8)); }
   catch (error) { notice(error.message,true); }
   window.history.replaceState(null,'',APP_URL);
-}
+} else if (restoreSession()) notice('Rejoining your saved room.');
 </script>
 </body>
 </html>
