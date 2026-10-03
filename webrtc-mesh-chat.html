@@ -667,7 +667,7 @@ async function startCamera() {
         showScanOutline(detected.points);
         if (detected.data !== lastRejectedCode || Date.now()-lastRejectedAt > 1500) {
           $('scanner-note').textContent = 'QR found. Reading connection details…';
-          await new Promise(resolve => setTimeout(resolve, 280));
+          await new Promise(resolve => setTimeout(resolve, 450));
           if (run !== scannerRun || !scanStream || !$('scanner').open) return;
           if (await useCode(detected.data)) return;
           lastRejectedCode = detected.data; lastRejectedAt = Date.now();
