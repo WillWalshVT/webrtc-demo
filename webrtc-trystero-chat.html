@@ -352,11 +352,6 @@ function closeInvite() {
   for (const addedId of active.pending.values()) revokeMember(addedId);
   active.room.leave();
 }
-function hideSingleUseInvite(current) {
-  current.open = false;
-  $('invite-active').hidden = true; $('invite-qr').textContent = '';
-  if ($('invite-dialog').open) $('invite-dialog').close();
-}
 function qr(value, element) {
   const code = qrcode(0,'L'); code.addData(value); code.make();
   element.innerHTML = code.createSvgTag({cellSize:4,margin:24,scalable:true});
@@ -366,13 +361,9 @@ function createInvite(multi) {
   const id = token(12), secret = token(), expires = Date.now()+300000;
   const room = joinRoom(configFor(sessionAppId,secret), 'invite-' + id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
-      if (invite !== current || !current.open) throw new Error('Invite closed');
+      if (invite !== current || !current.open || (!multi && current.claimed && current.claimed !== peerId)) throw new Error('Invite closed');
       await secureHandshake(secret,'invite-' + id,peerId,send,receive,isInitiator);
-      if (invite !== current || !current.open) throw new Error('Invite closed');
-      if (!multi) {
-        current.claimed = peerId;
-        hideSingleUseInvite(current);
-      }
+      if (invite !== current || !current.open || (!multi && current.claimed && current.claimed !== peerId)) throw new Error('Invite closed');
     },
     onJoinError:() => {}
   });
@@ -396,7 +387,7 @@ function createInvite(multi) {
   current.timer = setTimeout(() => { if (invite === current) closeInvite(); }, 300000);
 }
 async function handleInvitePeer(current, peerId, identity) {
-  if (invite !== current || Date.now() > current.expires || (!current.open && current.claimed !== peerId)) {
+  if (invite !== current || !current.open || Date.now() > current.expires || (!current.multi && current.claimed && current.claimed !== peerId)) {
     await current.deny.send('This invite is closed.', {target:peerId}).catch(() => {}); return;
   }
   if (!validToken(identity?.id,16) || !validToken(identity?.key) || !normalizeName(identity?.name || '',24) || members.has(identity.id)) {
@@ -407,7 +398,7 @@ async function handleInvitePeer(current, peerId, identity) {
   current.pending.set(peerId,identity.id);
   try {
     await grantPeer(identity.id,identity.key,identity.name);
-    if (invite !== current || (!current.open && current.claimed !== peerId)) { revokeMember(identity.id); return; }
+    if (invite !== current || !current.open || (!current.multi && current.claimed !== peerId)) { revokeMember(identity.id); return; }
     await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, members:[...members]}, {target:peerId});
   } catch {
     current.pending.delete(peerId);
@@ -491,7 +482,7 @@ function beginJoin() {
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
   show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...';
-  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Invite rejected: it may be closed or the inviter could not be reached. Ask for a new code.', true); } }, 12000);
+  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('The inviter could not be reached. The code may be closed, or the signaling relay may be slow. Ask for a fresh invite.', true); } }, 12000);
 }
 async function leaveRoom() {
   closeInvite(); cancelJoin();
