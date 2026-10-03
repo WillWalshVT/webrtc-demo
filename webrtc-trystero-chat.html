@@ -126,15 +126,50 @@ try {
 }
 const $ = id => document.getElementById(id);
 const APP_URL = location.origin + location.pathname;
-const CONFIG = {appId:'dev.willwalshvt.webrtc-signal-chat', rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}};
+const configFor = (appId, password) => ({appId, password, rtcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
 const names = new Map(), messages = new Map(), allowed = new Set(), grantWaiters = new Map();
-let mesh, meshId, localName, roomName, invite, joinAttempt, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
+let mesh, meshId, meshKey, sessionAppId, localName, roomName, invite, joinAttempt, scanStream, scanFrame, scanBusy = false, scannerRun = 0, detector;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
-function token() {
-  const bytes = crypto.getRandomValues(new Uint8Array(18));
+function token(size = 18) {
+  const bytes = crypto.getRandomValues(new Uint8Array(size));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function bytesFromToken(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('Invalid proof.');
+  return Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+}
+async function proofKey(secret) {
+  return crypto.subtle.importKey('raw', bytesFromToken(secret), {name:'HMAC',hash:'SHA-256'}, false, ['sign','verify']);
+}
+async function signProof(key, message) {
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(message)));
+  return btoa(String.fromCharCode(...signature)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function verifyProof(key, message, proof) {
+  try { return await crypto.subtle.verify('HMAC',key,bytesFromToken(proof),new TextEncoder().encode(message)); }
+  catch { return false; }
+}
+async function secureHandshake(secret, context, peerId, send, receive, isInitiator) {
+  const key = await proofKey(secret);
+  const participants = [selfId,peerId].sort().join(':');
+  const label = context + '|' + participants + '|';
+  if (isInitiator) {
+    const first = token();
+    await send({nonce:first});
+    const {data} = await receive();
+    if (typeof data?.nonce !== 'string' || !/^[A-Za-z0-9_-]{24}$/.test(data.nonce) ||
+        !await verifyProof(key,label + 'reply|' + first + '|' + data.nonce,data.proof)) throw new Error('Invalid access proof.');
+    await send({proof:await signProof(key,label + 'finish|' + first + '|' + data.nonce)});
+  } else {
+    const {data} = await receive();
+    if (typeof data?.nonce !== 'string' || !/^[A-Za-z0-9_-]{24}$/.test(data.nonce)) throw new Error('Invalid challenge.');
+    const second = token();
+    await send({nonce:second,proof:await signProof(key,label + 'reply|' + data.nonce + '|' + second)});
+    const response = await receive();
+    if (!await verifyProof(key,label + 'finish|' + data.nonce + '|' + second,response.data?.proof)) throw new Error('Invalid access proof.');
+  }
 }
 function encode(data) { return btoa(unescape(encodeURIComponent(JSON.stringify(data)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
 function decode(value) {
@@ -183,10 +218,14 @@ function resolveGrant(id, peerId) {
   waiter.remaining.delete(peerId);
   if (!waiter.remaining.size) { clearTimeout(waiter.timer); grantWaiters.delete(id); waiter.resolve(); }
 }
-function openMesh(id, knownPeers = []) {
-  meshId = id; knownPeers.forEach(peerId => allowed.add(peerId));
-  mesh = joinRoom(CONFIG, 'mesh-' + id, {
-    onPeerHandshake: peerId => { if (!allowed.has(peerId)) throw new Error('Not admitted to this room'); },
+function openMesh(id, key, knownPeers = []) {
+  meshId = id; meshKey = key; knownPeers.forEach(peerId => allowed.add(peerId));
+  mesh = joinRoom(configFor(sessionAppId,key), 'mesh-' + id, {
+    onPeerHandshake: async (peerId, send, receive, isInitiator) => {
+      if (!allowed.has(peerId)) throw new Error('Not admitted to this room');
+      await secureHandshake(meshKey,'mesh-' + meshId,peerId,send,receive,isInitiator);
+      if (!allowed.has(peerId)) throw new Error('Admission revoked');
+    },
     onJoinError: details => { if (details.peerId && allowed.has(details.peerId)) notice('Could not connect to a peer. This network may require a relay.', true); }
   });
   const nameAction = mesh.makeAction('name');
@@ -246,25 +285,41 @@ function closeInvite() {
   for (const peerId of active.pending) revokePeer(peerId);
   active.room.leave();
 }
+function hideSingleUseInvite(current) {
+  current.open = false;
+  $('invite-active').hidden = true; $('invite-qr').textContent = '';
+  if ($('invite-dialog').open) $('invite-dialog').close();
+}
 function qr(value, element) {
   const code = qrcode(0,'L'); code.addData(value); code.make();
   element.innerHTML = code.createSvgTag({cellSize:4,margin:24,scalable:true});
 }
 function createInvite(multi) {
   closeInvite();
-  const id = token(), expires = Date.now()+300000;
-  const room = joinRoom(CONFIG, 'invite-' + id, {onJoinError:() => {}});
+  const id = token(12), secret = token(), expires = Date.now()+300000;
+  const room = joinRoom(configFor(sessionAppId,secret), 'invite-' + id, {
+    onPeerHandshake: async (peerId, send, receive, isInitiator) => {
+      if (invite !== current || !current.open) throw new Error('Invite closed');
+      await secureHandshake(secret,'invite-' + id,peerId,send,receive,isInitiator);
+      if (invite !== current || !current.open) throw new Error('Invite closed');
+      if (!multi) {
+        current.claimed = peerId;
+        hideSingleUseInvite(current);
+      }
+    },
+    onJoinError:() => {}
+  });
   const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny');
   const current = {id, room, admit, ack, deny, multi, expires, open:true, claimed:null, pending:new Set(), admitted:new Set(), timer:null};
   invite = current;
   room.onPeerJoin = peerId => void handleInvitePeer(current, peerId);
   ack.onMessage = ({inviteId}, {peerId}) => {
-    if (invite !== current || !current.open || inviteId !== id || !current.pending.has(peerId)) return;
+    if (invite !== current || inviteId !== id || !current.pending.has(peerId)) return;
     current.pending.delete(peerId); current.admitted.add(peerId);
     if (!current.multi) closeInvite();
     else $('invite-status').textContent = 'Invite open. ' + current.admitted.size + ' joined.';
   };
-  const payload = {v:1, id, host:selfId, roomName, expires};
+  const payload = {v:2, a:sessionAppId, i:id, h:selfId, n:roomName, e:expires, k:secret};
   const link = APP_URL + '?pair=' + id + '#invite=' + encode(payload);
   $('invite-options').hidden = true; $('invite-active').hidden = false;
   $('invite-status').textContent = multi ? 'Invite open for multiple clients.' : 'Invite open for one client.';
@@ -274,7 +329,7 @@ function createInvite(multi) {
   current.timer = setTimeout(() => { if (invite === current) closeInvite(); }, 300000);
 }
 async function handleInvitePeer(current, peerId) {
-  if (invite !== current || !current.open || Date.now() > current.expires || (!current.multi && current.claimed && current.claimed !== peerId)) {
+  if (invite !== current || Date.now() > current.expires || (!current.open && current.claimed !== peerId)) {
     await current.deny.send('This invite is closed.', {target:peerId}).catch(() => {}); return;
   }
   if (current.pending.has(peerId) || current.admitted.has(peerId)) return;
@@ -282,12 +337,12 @@ async function handleInvitePeer(current, peerId) {
   current.pending.add(peerId);
   try {
     await grantPeer(peerId);
-    if (invite !== current || !current.open) { revokePeer(peerId); return; }
+    if (invite !== current || (!current.open && current.claimed !== peerId)) { revokePeer(peerId); return; }
     const peers = [selfId, ...Object.keys(mesh.getPeers())];
-    await current.admit.send({inviteId:current.id, meshId, roomName, peers}, {target:peerId});
+    await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, peers}, {target:peerId});
   } catch {
     current.pending.delete(peerId);
-    if (!current.multi) current.claimed = null;
+    if (!current.multi) closeInvite();
     revokePeer(peerId);
     await current.deny.send('Could not prepare this connection. Try again.', {target:peerId}).catch(() => {});
   }
@@ -296,9 +351,11 @@ function parseInvite(raw) {
   let value = raw.trim();
   if (value.includes('#invite=')) value = value.split('#invite=')[1];
   const data = decode(value);
-  if (data?.v !== 1 || typeof data.id !== 'string' || !/^[A-Za-z0-9_-]{24}$/.test(data.id) || typeof data.host !== 'string' || !normalizeName(data.roomName,48) || !Number.isFinite(data.expires)) throw new Error('This is not a valid invite.');
-  if (Date.now() > data.expires) throw new Error('This invite has expired.');
-  return data;
+  if (data?.v !== 2 || !/^[A-Za-z0-9_-]{24}$/.test(data.a) || !/^[A-Za-z0-9_-]{16}$/.test(data.i) ||
+      typeof data.h !== 'string' || !normalizeName(data.n,48) || !Number.isFinite(data.e) ||
+      !/^[A-Za-z0-9_-]{24}$/.test(data.k)) throw new Error('This is not a valid invite.');
+  if (Date.now() > data.e) throw new Error('This invite has expired.');
+  return {appId:data.a,id:data.i,host:data.h,roomName:data.n,expires:data.e,secret:data.k};
 }
 function prepareJoin(raw) {
   const data = parseInvite(raw);
@@ -320,13 +377,25 @@ function beginJoin() {
   if (!current || Date.now() > current.data.expires) { cancelJoin(); notice('Invite expired. Scan a new code.', true); return; }
   localName = normalizeName($('join-name').value,24);
   if (!localName) return;
-  const room = joinRoom(CONFIG, 'invite-' + current.data.id, {onJoinError:() => {}});
+  const room = joinRoom(configFor(current.data.appId,current.data.secret), 'invite-' + current.data.id, {
+    onPeerHandshake: async (peerId, send, receive, isInitiator) => {
+      if (peerId !== current.data.host || joinAttempt !== current) throw new Error('Unexpected inviter');
+      await secureHandshake(current.data.secret,'invite-' + current.data.id,peerId,send,receive,isInitiator);
+      if (joinAttempt !== current) throw new Error('Invite cancelled');
+    },
+    onJoinError:details => {
+      if (details.peerId === current.data.host && joinAttempt === current) {
+        cancelJoin(); notice('Invite closed or access denied. Ask for a new code.',true);
+      }
+    }
+  });
   current.room = room;
   const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny');
   admit.onMessage = async (data, {peerId}) => {
     if (peerId !== current.data.host || joinAttempt !== current || data?.inviteId !== current.data.id || typeof data.meshId !== 'string' || !Array.isArray(data.peers)) return;
     clearTimeout(current.timer);
-    roomName = data.roomName; openMesh(data.meshId, data.peers);
+    if (!/^[A-Za-z0-9_-]{24}$/.test(data.meshId) || !/^[A-Za-z0-9_-]{24}$/.test(data.meshKey)) return;
+    sessionAppId = current.data.appId; roomName = data.roomName; openMesh(data.meshId, data.meshKey, data.peers);
     await ack.send({inviteId:current.data.id}, {target:peerId}).catch(() => {});
     setTimeout(() => { room.leave(); if (joinAttempt === current) joinAttempt = null; }, 500);
   };
@@ -337,7 +406,7 @@ function beginJoin() {
 function leaveRoom() {
   closeInvite(); cancelJoin();
   if (mesh) mesh.leave();
-  mesh = null; meshId = null; localName = null; roomName = null;
+  mesh = null; meshId = null; meshKey = null; sessionAppId = null; localName = null; roomName = null;
   names.clear(); messages.clear(); allowed.clear(); renderMessages();
   show('home'); notice('');
 }
@@ -441,7 +510,7 @@ $('host-form').onsubmit = event => {
   event.preventDefault();
   const name = normalizeName($('host-name').value,24), title = normalizeName($('room-name').value,48);
   if (!name || !title) return;
-  localName = name; roomName = title; openMesh(token());
+  localName = name; roomName = title; sessionAppId = token(); openMesh(token(),token());
   createInvite($('first-multi').checked);
 };
 $('join-form').onsubmit = event => { event.preventDefault(); beginJoin(); };
