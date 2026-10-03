@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC Mesh Chat</title>
+<style>
+:root{color-scheme:light;font:16px system-ui,sans-serif;color:#17262b;background:#f5f7f6}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh}
+button,input,textarea{font:inherit}
+button{cursor:pointer}
+button:disabled{cursor:default;opacity:.5}
+[hidden]{display:none!important}
+.shell{max-width:920px;margin:auto;padding:0 20px 32px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:68px;border-bottom:1px solid #d8e0df}
+header strong{font-size:18px;font-weight:700}
+header a{color:#365761;text-decoration:none;font-size:14px}
+main{padding-top:28px}
+h1,h2,p{margin-top:0}
+h1{font-size:28px;line-height:1.2;margin-bottom:10px}
+h2{font-size:17px;line-height:1.3;margin-bottom:14px}
+.muted{color:#5b6d72}
+.hint{font-size:14px;color:#5b6d72;line-height:1.5}
+.field{display:grid;gap:7px;max-width:380px;margin:24px 0}
+label{font-weight:600}
+input,textarea{width:100%;min-width:0;border:1px solid #aebdbc;border-radius:6px;background:#fff;color:#17262b;padding:11px 12px}
+input:focus,textarea:focus{outline:2px solid #157d78;outline-offset:1px}
+.actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
+.button{border:1px solid #aebdbc;border-radius:6px;padding:10px 15px;background:#fff;color:#17262b;font-weight:600;min-height:44px}
+.button:hover:not(:disabled){background:#eaf0ef}
+.button.primary{background:#126c68;border-color:#126c68;color:#fff}
+.button.primary:hover:not(:disabled){background:#0c5753}
+.button.quiet{border-color:transparent;background:transparent;color:#365761}
+.banner{margin:18px 0;padding:10px 12px;border-left:3px solid #157d78;background:#eaf3f2;color:#254447;font-size:14px}
+.banner.error{border-left-color:#ba4e42;background:#fff0ed;color:#8a342b}
+.room-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:20px}
+.room-head h1{margin-bottom:4px}
+.room-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:24px}
+.conversation{min-width:0;border:1px solid #d8e0df;background:#fff;border-radius:6px;display:flex;flex-direction:column;height:min(65vh,620px);min-height:350px}
+.messages{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.message{line-height:1.4;overflow-wrap:anywhere}
+.message .meta{font-size:12px;color:#65777a;margin-bottom:3px}
+.message.mine .meta{color:#126c68}
+.message p{margin:0}
+.empty{color:#65777a;margin:auto;text-align:center}
+.composer{display:flex;gap:8px;padding:12px;border-top:1px solid #d8e0df}
+.composer input{flex:1}
+.peers{border-top:1px solid #d8e0df;padding-top:16px}
+.peer-list{list-style:none;margin:0;padding:0}
+.peer-list li{display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid #e5eae9;min-width:0}
+.peer-name{flex:1;min-width:0;overflow-wrap:anywhere}
+.dot{width:8px;height:8px;flex:none;border-radius:50%;background:#d1883b}
+.dot.online{background:#17806b}
+.dot.offline{background:#aebdbc}
+.peer-state{font-size:12px;color:#65777a}
+.pair-panel{border:1px solid #d8e0df;border-radius:6px;background:#fff;padding:18px;margin-top:20px;max-width:530px}
+.pair-panel h2{margin-bottom:8px}
+.pair-panel p{line-height:1.5}
+.qr{display:grid;place-items:center;background:#fff;margin:12px 0;min-height:200px}
+.qr svg{display:block;max-width:100%;height:auto}
+.link-line{font-size:13px;overflow-wrap:anywhere;color:#365761;margin:12px 0}
+.small{font-size:13px}
+dialog{border:1px solid #cbd6d4;border-radius:6px;box-shadow:0 16px 48px #162d322e;padding:0;width:min(94vw,520px);max-height:90vh;color:#17262b}
+dialog::backdrop{background:#11252999}
+.dialog-inner{padding:20px}
+.dialog-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.dialog-head h2{margin:0}
+.scanner-video{width:100%;aspect-ratio:4/3;object-fit:cover;background:#182b2d;border-radius:4px;margin:16px 0}
+.scanner-tools{display:grid;gap:14px;margin-top:16px}
+.scanner-tools .field{margin:0;max-width:none}
+.file-input{padding:8px}
+@media(max-width:700px){.shell{padding:0 14px 22px}header{min-height:60px}.room-head{display:block}.room-actions{justify-content:flex-start;margin-top:14px}.layout{grid-template-columns:1fr}.conversation{height:55vh;min-height:320px}.peers{padding-bottom:12px}.pair-panel{padding:14px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="shell">
+<header><strong>Mesh Chat</strong><a href="./">Simple button demo</a></header>
+<main>
+<section id="entry">
+  <h1>Start a session</h1>
+  <p class="muted">Connect devices directly with a QR exchange.</p>
+  <div class="field"><label for="username">Your name</label><input id="username" maxlength="24" autocomplete="nickname" required placeholder="Enter a username"></div>
+  <div class="actions"><button class="button primary" id="create">Create</button><button class="button" id="join">Join</button></div>
+  <p id="prefill" class="banner" hidden></p>
+</section>
+<section id="joining" hidden>
+  <h1>Join session</h1>
+  <p id="joining-text" class="muted"></p>
+  <div class="pair-panel"><h2>Your client code</h2><p>Have the inviting device select <strong>Scan client code</strong> and scan this QR.</p><div id="answer-qr" class="qr"></div><div class="actions"><button class="button" id="copy-answer">Copy code</button><button class="button quiet" id="cancel-join">Cancel</button></div><p id="answer-copy" class="link-line" hidden></p></div>
+</section>
+<section id="room" hidden>
+  <div class="room-head"><div><h1>Chatroom</h1><div id="room-summary" class="muted small"></div></div><div class="room-actions"><button class="button primary" id="add-client">Add client</button><button class="button" id="scan-answer" disabled>Scan client code</button><button class="button quiet" id="leave">Leave</button></div></div>
+  <div class="layout"><div class="conversation"><div id="messages" class="messages" role="log" aria-live="polite"><p class="empty">Messages will appear here.</p></div><form id="composer" class="composer"><input id="message" maxlength="2000" autocomplete="off" aria-label="Message" placeholder="Message the room"><button class="button primary" type="submit">Send</button></form></div><aside class="peers"><h2>People <span id="peer-count">(1)</span></h2><ul id="peer-list" class="peer-list"></ul><p id="mesh-state" class="hint"></p></aside></div>
+  <div id="invite-panel" class="pair-panel" hidden><h2>Invite a client</h2><p>On the other device, scan this QR with its camera, or open this page and select Join.</p><div id="invite-qr" class="qr"></div><div class="actions"><button class="button" id="copy-invite">Copy invite link</button><button class="button quiet" id="cancel-invite">Cancel invite</button></div><p id="invite-copy" class="link-line" hidden></p><p id="invite-note" class="hint"></p></div>
+</section>
+<p id="notice" class="banner" role="status" hidden></p>
+</main>
+</div>
+<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const APP_URL = location.origin + location.pathname;
+const STUN = [{urls:'stun:stun.l.google.com:19302'}];
+const peers = new Map();
+const members = new Map();
+const seen = new Set();
+const offlineTimers = new Map();
+let localId, localName, roomId, pendingInvite, pendingJoin, inviteLink, answerCode;
+let scanStream, scanFrame, scanKind, scanLast = 0;
+const scanCanvas = document.createElement('canvas');
+const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
+
+function notice(message, error = false) {
+  $('notice').textContent = message;
+  $('notice').classList.toggle('error', error);
+  $('notice').hidden = !message;
+}
+function nameFromInput() {
+  const input = $('username');
+  input.value = input.value.trim();
+  if (!input.value) { input.setCustomValidity('Enter a username.'); input.reportValidity(); return null; }
+  input.setCustomValidity('');
+  return input.value;
+}
+$('username').addEventListener('input', () => $('username').setCustomValidity(''));
+function makeId() { return crypto.randomUUID(); }
+function isId(value) { return typeof value === 'string' && /^[0-9a-f-]{36}$/i.test(value); }
+function isName(value) { return typeof value === 'string' && value.trim().length > 0 && value.length <= 24; }
+function encode(data) {
+  const bytes = pako.deflate(JSON.stringify(data));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function decode(code) {
+  if (typeof code !== 'string' || code.length > 12000 || !/^[A-Za-z0-9_-]+$/.test(code)) throw new Error('Invalid or oversized pairing code.');
+  const b64 = code.replace(/-/g,'+').replace(/_/g,'/');
+  const bytes = Uint8Array.from(atob(b64), char => char.charCodeAt(0));
+  const json = pako.inflate(bytes, {to:'string'});
+  if (json.length > 60000) throw new Error('Pairing code is too large.');
+  return JSON.parse(json);
+}
+function qr(value, element) {
+  element.textContent = '';
+  const code = qrcode(0, 'L');
+  code.addData(value); code.make();
+  element.innerHTML = code.createSvgTag({cellSize:4, margin:12, scalable:true});
+}
+function show(section) {
+  for (const id of ['entry','joining','room']) $(id).hidden = id !== section;
+  notice('');
+}
+function renderPeers() {
+  const list = $('peer-list');
+  list.textContent = '';
+  const active = [...peers.values()].filter(peer => peer.dc?.readyState === 'open');
+  const entries = [{id:localId, name:localName, state:'You'}, ...[...members.values()].filter(member => member.id !== localId).map(member => {
+    const peer = peers.get(member.id);
+    return {...member, state:peer?.dc?.readyState === 'open' ? 'Connected' : peer ? 'Connecting' : 'Offline'};
+  })];
+  for (const item of entries) {
+    const li = document.createElement('li');
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + (item.state === 'You' || item.state === 'Connected' ? 'online' : item.state === 'Offline' ? 'offline' : '');
+    const name = document.createElement('span'); name.className = 'peer-name'; name.textContent = item.name;
+    const state = document.createElement('span'); state.className = 'peer-state'; state.textContent = item.state;
+    li.append(dot, name, state); list.append(li);
+  }
+  $('peer-count').textContent = '(' + entries.length + ')';
+  $('room-summary').textContent = active.length ? active.length + ' connected peer' + (active.length === 1 ? '' : 's') : 'Waiting for a peer';
+  $('message').disabled = active.length === 0;
+  $('composer').querySelector('button').disabled = active.length === 0;
+  const missing = entries.filter(item => item.state === 'Connecting' || item.state === 'Offline').length;
+  $('mesh-state').textContent = missing ? 'Building direct links to ' + missing + ' peer' + (missing === 1 ? '' : 's') + '.' : active.length ? 'Direct links to all known peers are ready.' : 'Create an invite to add someone.';
+}
+function rememberMember(id, name) {
+  if (!isId(id) || !isName(name) || id === localId) return;
+  members.set(id, {id, name:name.trim()});
+  renderPeers();
+  maybeConnect(id);
+}
+function peerGone(peer) {
+  if (!peer.id || peers.get(peer.id) !== peer) return;
+  peers.delete(peer.id);
+  clearTimeout(offlineTimers.get(peer.id));
+  const id = peer.id;
+  offlineTimers.set(id, setTimeout(() => {
+    if (peers.get(id)?.dc?.readyState !== 'open') members.delete(id);
+    offlineTimers.delete(id); renderPeers();
+  }, 15000));
+  setTimeout(() => { if (members.has(id)) void maybeConnect(id); }, 500);
+  renderPeers();
+}
+function newPeer(id, name, createChannel = false) {
+  const pc = new RTCPeerConnection({iceServers:STUN});
+  const peer = {id, name, pc, dc:null, failureTimer:null};
+  if (id) peers.set(id, peer);
+  pc.ondatachannel = event => attach(peer, event.channel);
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+      if (!peer.failureTimer) peer.failureTimer = setTimeout(() => {
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') dropPeer(peer);
+      }, 8000);
+    } else { clearTimeout(peer.failureTimer); peer.failureTimer = null; }
+    renderPeers();
+  };
+  if (createChannel) attach(peer, pc.createDataChannel('mesh-chat'));
+  return peer;
+}
+function dropPeer(peer) {
+  clearTimeout(peer.failureTimer);
+  peerGone(peer);
+  peer.pc.close();
+  if (pendingInvite?.peer === peer) cancelInvite();
+  renderPeers();
+}
+function send(peer, message) {
+  if (peer.dc?.readyState !== 'open') return false;
+  peer.dc.send(JSON.stringify(message));
+  return true;
+}
+function flood(message, exceptId) {
+  for (const peer of peers.values()) if (peer.id !== exceptId) send(peer, message);
+}
+function rememberEnvelope(id) {
+  if (!isId(id) || seen.has(id)) return false;
+  seen.add(id);
+  if (seen.size > 2000) seen.delete(seen.values().next().value);
+  return true;
+}
+function announce(member) {
+  const message = {kind:'presence', id:makeId(), room:roomId, member};
+  rememberEnvelope(message.id); flood(message);
+}
+function roster() {
+  return [{id:localId, name:localName}, ...[...peers.values()].filter(peer => peer.id && peer.dc?.readyState === 'open').map(peer => ({id:peer.id, name:peer.name}))];
+}
+function attach(peer, dc) {
+  peer.dc = dc;
+  dc.onopen = () => {
+    if (peer.id && peers.get(peer.id) !== peer) peers.set(peer.id, peer);
+    clearTimeout(offlineTimers.get(peer.id)); offlineTimers.delete(peer.id);
+    send(peer, {kind:'hello', room:roomId, id:localId, name:localName});
+    send(peer, {kind:'roster', room:roomId, members:roster()});
+    if (peer.id) { rememberMember(peer.id, peer.name); announce({id:peer.id, name:peer.name}); }
+    if (pendingInvite?.peer === peer) { pendingInvite = null; $('invite-panel').hidden = true; $('scan-answer').disabled = true; }
+    if (pendingJoin?.peer === peer) { pendingJoin = null; show('room'); }
+    renderPeers();
+  };
+  dc.onmessage = event => {
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (!message || message.room !== roomId) return;
+    handleMessage(peer, message).catch(error => notice(error.message, true));
+  };
+  dc.onclose = () => {
+    if (peer.dc === dc) {
+      peerGone(peer);
+      if (peer.pc.signalingState !== 'closed') peer.pc.close();
+    }
+  };
+  dc.onerror = () => notice('A peer connection reported an error.', true);
+}
+async function handleMessage(peer, message) {
+  if (message.kind === 'hello') {
+    if (message.id !== peer.id || !isName(message.name)) return;
+    peer.name = message.name.trim(); rememberMember(peer.id, peer.name);
+  } else if (message.kind === 'roster' && Array.isArray(message.members)) {
+    for (const member of message.members.slice(0, 32)) rememberMember(member.id, member.name);
+  } else if (message.kind === 'presence') {
+    if (!rememberEnvelope(message.id)) return;
+    rememberMember(message.member?.id, message.member?.name);
+    flood(message, peer.id);
+  } else if (message.kind === 'signal') {
+    if (!rememberEnvelope(message.id) || !isId(message.from) || !isId(message.to) || !isName(message.name)) return;
+    if (message.to === localId) await receiveSignal(message);
+    else if (message.hops > 0) flood({...message, hops:message.hops-1}, peer.id);
+  } else if (message.kind === 'chat') {
+    if (!rememberEnvelope(message.id) || !isId(message.from) || !isName(message.name) || typeof message.text !== 'string' || message.text.length > 2000) return;
+    addMessage(message);
+    if (message.hops > 0) flood({...message, hops:message.hops-1}, peer.id);
+  } else if (message.kind === 'leave') {
+    if (!rememberEnvelope(message.id) || !isId(message.from)) return;
+    const leaving = peers.get(message.from);
+    if (leaving) dropPeer(leaving);
+    clearTimeout(offlineTimers.get(message.from)); offlineTimers.delete(message.from);
+    members.delete(message.from); renderPeers();
+    if (message.hops > 0) flood({...message, hops:message.hops-1}, peer.id);
+  }
+}
+function signal(to, description) {
+  const message = {kind:'signal', id:makeId(), room:roomId, from:localId, name:localName, to, description, hops:16};
+  rememberEnvelope(message.id); flood(message);
+}
+async function receiveSignal(message) {
+  const description = message.description;
+  if (!description || !['offer','answer'].includes(description.type) || typeof description.sdp !== 'string' || description.sdp.length > 50000) return;
+  rememberMember(message.from, message.name);
+  let peer = peers.get(message.from);
+  if (description.type === 'offer') {
+    if (peer) return;
+    peer = newPeer(message.from, message.name);
+    await peer.pc.setRemoteDescription(description);
+    await peer.pc.setLocalDescription(await peer.pc.createAnswer());
+    await gather(peer.pc);
+    signal(message.from, peer.pc.localDescription);
+  } else if (peer?.pc.signalingState === 'have-local-offer') {
+    await peer.pc.setRemoteDescription(description);
+  }
+}
+async function maybeConnect(id) {
+  if (!localId || localId > id || peers.has(id) || !roomId) return;
+  const member = members.get(id);
+  if (!member || ![...peers.values()].some(peer => peer.dc?.readyState === 'open')) return;
+  const peer = newPeer(id, member.name, true);
+  try {
+    await peer.pc.setLocalDescription(await peer.pc.createOffer());
+    await gather(peer.pc);
+    if (peers.get(id) === peer) signal(id, peer.pc.localDescription);
+  } catch (error) { dropPeer(peer); notice('Could not connect to ' + member.name + ': ' + error.message, true); }
+}
+async function gather(pc) {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Network discovery timed out.')); }, 20000);
+    const changed = () => { if (pc.iceGatheringState === 'complete') { cleanup(); resolve(); } };
+    function cleanup() { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', changed); }
+    pc.addEventListener('icegatheringstatechange', changed); changed();
+  });
+}
+function addMessage(message) {
+  const list = $('messages');
+  list.querySelector('.empty')?.remove();
+  const item = document.createElement('div'); item.className = 'message' + (message.from === localId ? ' mine' : '');
+  const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = message.name;
+  const body = document.createElement('p'); body.textContent = message.text;
+  item.append(meta, body); list.append(item);
+  list.scrollTop = list.scrollHeight;
+}
+function resetRoom() {
+  for (const timer of offlineTimers.values()) clearTimeout(timer);
+  offlineTimers.clear();
+  for (const peer of peers.values()) { clearTimeout(peer.failureTimer); peer.pc.close(); }
+  if (pendingInvite) pendingInvite.peer.pc.close();
+  peers.clear(); members.clear(); seen.clear();
+  pendingInvite = null; pendingJoin = null; inviteLink = null; answerCode = null;
+  localId = null; roomId = null;
+  $('invite-panel').hidden = true; $('scan-answer').disabled = true;
+  $('messages').innerHTML = '<p class="empty">Messages will appear here.</p>';
+  show('entry');
+}
+async function createInvite() {
+  if (pendingInvite) { $('invite-panel').hidden = false; return; }
+  const peer = newPeer(null, '', true);
+  const nonce = makeId();
+  pendingInvite = {peer, nonce};
+  $('add-client').disabled = true;
+  $('invite-panel').hidden = false;
+  $('invite-qr').textContent = 'Preparing invite…';
+  $('invite-note').textContent = '';
+  try {
+    await peer.pc.setLocalDescription(await peer.pc.createOffer());
+    await gather(peer.pc);
+    if (pendingInvite?.peer !== peer) return;
+    const offer = {v:1, kind:'offer', room:roomId, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
+    const token = encode(offer);
+    inviteLink = APP_URL + '#invite=' + token;
+    try { qr(inviteLink, $('invite-qr')); }
+    catch { qr('MESH1:' + token, $('invite-qr')); $('invite-note').textContent = 'This QR opens inside the chat page. On a phone, open the page and select Join, or use Copy invite link.'; }
+    $('invite-copy').textContent = inviteLink;
+    $('scan-answer').disabled = false;
+  } catch (error) { dropPeer(peer); notice('Could not create invite: ' + error.message, true); }
+  finally { $('add-client').disabled = false; }
+}
+function cancelInvite() {
+  const invite = pendingInvite;
+  pendingInvite = null; inviteLink = null;
+  if (invite) invite.peer.pc.close();
+  $('invite-panel').hidden = true; $('scan-answer').disabled = true;
+}
+async function joinOffer(raw) {
+  const name = nameFromInput();
+  if (!name) return;
+  let token = raw.trim();
+  if (token.startsWith('MESH1:')) token = token.slice(6);
+  else if (token.includes('#invite=')) token = token.split('#invite=')[1];
+  const offer = decode(token);
+  if (offer.v !== 1 || offer.kind !== 'offer' || !isId(offer.room) || !isId(offer.nonce) || !isId(offer.from?.id) || !isName(offer.from?.name) || offer.description?.type !== 'offer' || typeof offer.description.sdp !== 'string' || offer.description.sdp.length > 50000) throw new Error('This is not a valid mesh invite.');
+  localId = makeId(); localName = name; roomId = offer.room;
+  const peer = newPeer(offer.from.id, offer.from.name);
+  pendingJoin = {peer};
+  rememberMember(peer.id, peer.name);
+  show('joining');
+  $('joining-text').textContent = 'Connecting to ' + peer.name + '. Preparing your answer code…';
+  try {
+    await peer.pc.setRemoteDescription(offer.description);
+    await peer.pc.setLocalDescription(await peer.pc.createAnswer());
+    await gather(peer.pc);
+    const answer = {v:1, kind:'answer', room:roomId, nonce:offer.nonce, from:{id:localId, name:localName}, to:peer.id, description:peer.pc.localDescription};
+    answerCode = 'MESH1:' + encode(answer);
+    qr(answerCode, $('answer-qr'));
+    $('answer-copy').textContent = answerCode;
+    $('joining-text').textContent = 'Waiting for ' + peer.name + ' to scan your code.';
+  } catch (error) { dropPeer(peer); resetRoom(); throw error; }
+}
+async function acceptAnswer(raw) {
+  if (!pendingInvite) throw new Error('Create an invite before scanning a client code.');
+  let token = raw.trim();
+  if (token.startsWith('MESH1:')) token = token.slice(6);
+  const answer = decode(token);
+  if (answer.v !== 1 || answer.kind !== 'answer' || answer.room !== roomId || answer.nonce !== pendingInvite.nonce || answer.to !== localId || !isId(answer.from?.id) || !isName(answer.from?.name) || answer.description?.type !== 'answer' || typeof answer.description.sdp !== 'string' || answer.description.sdp.length > 50000) throw new Error('This client code does not match the current invite.');
+  const peer = pendingInvite.peer;
+  if (peers.has(answer.from.id)) throw new Error('This client is already connected.');
+  peer.id = answer.from.id; peer.name = answer.from.name;
+  peers.set(peer.id, peer);
+  rememberMember(peer.id, peer.name);
+  await peer.pc.setRemoteDescription(answer.description);
+  notice('Connecting to ' + peer.name + '…');
+}
+function decodeImage(source, width, height) {
+  const scale = Math.min(1, 1400 / Math.max(width, height));
+  scanCanvas.width = Math.max(1, Math.round(width * scale));
+  scanCanvas.height = Math.max(1, Math.round(height * scale));
+  scanContext.drawImage(source, 0, 0, scanCanvas.width, scanCanvas.height);
+  const image = scanContext.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+  return jsQR(image.data, image.width, image.height, {inversionAttempts:'attemptBoth'})?.data;
+}
+function stopScanner() {
+  cancelAnimationFrame(scanFrame);
+  scanStream?.getTracks().forEach(track => track.stop());
+  scanStream = null;
+  $('scanner-video').srcObject = null;
+  $('scanner-video').hidden = true;
+}
+async function useCode(raw) {
+  try {
+    if (scanKind === 'invite') await joinOffer(raw);
+    else await acceptAnswer(raw);
+    $('scanner').close();
+  } catch (error) { $('scanner-note').textContent = error.message; }
+}
+async function openScanner(kind) {
+  scanKind = kind;
+  $('scanner-title').textContent = kind === 'invite' ? 'Scan invite QR' : 'Scan client code';
+  $('scanner-note').textContent = 'Point the camera at the QR code, scan a screenshot, or paste a code.';
+  $('scan-text').value = ''; $('scan-file').value = '';
+  $('scanner').showModal();
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}});
+    if (!$('scanner').open) { stopScanner(); return; }
+    const video = $('scanner-video'); video.srcObject = scanStream; video.hidden = false;
+    await video.play();
+    scanLast = 0;
+    function tick(now) {
+      if (!scanStream || !$('scanner').open) return;
+      if (now - scanLast > 150 && video.videoWidth) {
+        scanLast = now;
+        const code = decodeImage(video, video.videoWidth, video.videoHeight);
+        if (code) { stopScanner(); void useCode(code); return; }
+      }
+      scanFrame = requestAnimationFrame(tick);
+    }
+    scanFrame = requestAnimationFrame(tick);
+  } catch { stopScanner(); $('scanner-note').textContent = 'Camera unavailable. Scan a screenshot or paste a code.'; }
+}
+$('scanner').addEventListener('close', stopScanner);
+$('close-scanner').onclick = () => $('scanner').close();
+$('use-pasted-code').onclick = () => void useCode($('scan-text').value);
+$('scan-file').onchange = async event => {
+  const file = event.target.files[0]; if (!file) return;
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image(); image.src = url; await image.decode();
+    const code = decodeImage(image, image.naturalWidth, image.naturalHeight);
+    if (!code) throw new Error('No readable QR code found.');
+    await useCode(code);
+  } catch (error) { $('scanner-note').textContent = error.message; }
+  finally { URL.revokeObjectURL(url); event.target.value = ''; }
+};
+$('create').onclick = async () => {
+  const name = nameFromInput(); if (!name) return;
+  localId = makeId(); localName = name; roomId = makeId();
+  show('room'); renderPeers(); await createInvite();
+};
+$('join').onclick = () => {
+  if (!nameFromInput()) return;
+  const prefill = $('prefill').dataset.code;
+  if (prefill) { void joinOffer(prefill).catch(error => notice(error.message, true)); }
+  else void openScanner('invite');
+};
+$('add-client').onclick = () => void createInvite();
+$('scan-answer').onclick = () => void openScanner('answer');
+$('cancel-invite').onclick = cancelInvite;
+$('cancel-join').onclick = resetRoom;
+$('copy-invite').onclick = async () => { try { await navigator.clipboard.writeText(inviteLink); notice('Invite link copied.'); } catch { $('invite-copy').hidden = false; } };
+$('copy-answer').onclick = async () => { try { await navigator.clipboard.writeText(answerCode); notice('Client code copied.'); } catch { $('answer-copy').hidden = false; } };
+$('composer').onsubmit = event => {
+  event.preventDefault();
+  const input = $('message'); const value = input.value.trim();
+  if (!value || ![...peers.values()].some(peer => peer.dc?.readyState === 'open')) return;
+  const message = {kind:'chat', id:makeId(), room:roomId, from:localId, name:localName, text:value, hops:16};
+  rememberEnvelope(message.id); addMessage(message); flood(message); input.value = ''; input.focus();
+};
+$('leave').onclick = () => {
+  const message = {kind:'leave', id:makeId(), room:roomId, from:localId, hops:16};
+  rememberEnvelope(message.id); flood(message); resetRoom();
+};
+window.addEventListener('pagehide', () => {
+  for (const peer of peers.values()) peer.pc.close();
+  if (pendingInvite) pendingInvite.peer.pc.close();
+  stopScanner();
+});
+if (!window.qrcode || !window.jsQR || !window.pako) {
+  notice('QR libraries could not load. Check your internet connection and reload.', true);
+  $('create').disabled = true; $('join').disabled = true;
+} else if (location.hash.startsWith('#invite=')) {
+  $('prefill').hidden = false;
+  $('prefill').textContent = 'Invite detected. Enter your name and select Join.';
+  $('prefill').dataset.code = location.hash.slice(8);
+  history.replaceState(null, '', APP_URL);
+}
+</script>
+</body>
+</html>
