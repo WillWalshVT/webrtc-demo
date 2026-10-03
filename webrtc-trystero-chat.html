@@ -367,9 +367,28 @@ function createInvite(multi) {
     },
     onJoinError:() => {}
   });
-  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request');
+  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request'), ready = room.makeAction('ready');
   const current = {id, room, admit, ack, deny, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null};
   invite = current;
+  room.onPeerJoin = peerId => {
+    if (invite !== current || !current.open || Date.now() > current.expires || (!multi && current.claimed)) {
+      void deny.send('This invite is closed.',{target:peerId}).catch(() => {}); return;
+    }
+    if (!multi) {
+      current.claimed = peerId;
+      current.open = false;
+      $('invite-active').hidden = true; $('invite-qr').textContent = '';
+      if ($('invite-dialog').open) $('invite-dialog').close();
+    } else {
+      $('invite-status').textContent = 'New user connecting...';
+    }
+    void ready.send({inviteId:id},{target:peerId}).catch(() => {});
+  };
+  room.onPeerLeave = peerId => {
+    if (invite !== current) return;
+    if (!multi && current.claimed === peerId) closeInvite();
+    else if (multi) $('invite-status').textContent = 'Invite open. ' + current.admitted.size + ' joined.';
+  };
   request.onMessage = (identity, {peerId}) => void handleInvitePeer(current,peerId,identity);
   ack.onMessage = ({inviteId}, {peerId}) => {
     if (invite !== current || inviteId !== id || !current.pending.has(peerId)) return;
@@ -387,7 +406,7 @@ function createInvite(multi) {
   current.timer = setTimeout(() => { if (invite === current) closeInvite(); }, 300000);
 }
 async function handleInvitePeer(current, peerId, identity) {
-  if (invite !== current || !current.open || Date.now() > current.expires || (!current.multi && current.claimed && current.claimed !== peerId)) {
+  if (invite !== current || Date.now() > current.expires || (!current.open && current.claimed !== peerId) || (!current.multi && current.claimed && current.claimed !== peerId)) {
     await current.deny.send('This invite is closed.', {target:peerId}).catch(() => {}); return;
   }
   if (!validToken(identity?.id,16) || !validToken(identity?.key) || !normalizeName(identity?.name || '',24) || members.has(identity.id)) {
@@ -398,7 +417,7 @@ async function handleInvitePeer(current, peerId, identity) {
   current.pending.set(peerId,identity.id);
   try {
     await grantPeer(identity.id,identity.key,identity.name);
-    if (invite !== current || !current.open || (!current.multi && current.claimed !== peerId)) { revokeMember(identity.id); return; }
+    if (invite !== current || (!current.open && current.claimed !== peerId)) { revokeMember(identity.id); return; }
     await current.admit.send({inviteId:current.id, meshId, meshKey, roomName, members:[...members]}, {target:peerId});
   } catch {
     current.pending.delete(peerId);
@@ -419,12 +438,12 @@ function parseInvite(raw) {
 }
 function prepareJoin(raw) {
   const data = parseInvite(raw);
-  joinAttempt = {data, room:null, timer:null};
+  if (joinAttempt) cancelJoin();
+  joinAttempt = {data, room:null, timer:null, ready:false};
   $('join-room-name').textContent = data.roomName;
   $('join-description').textContent = 'Invited to ' + data.roomName;
-  show('join-setup'); notice('');
   if ($('scanner').open) $('scanner').close();
-  $('join-name').focus();
+  startInviteConnection(joinAttempt);
 }
 function cancelJoin() {
   if (joinAttempt?.room) joinAttempt.room.leave();
@@ -434,11 +453,20 @@ function cancelJoin() {
 }
 function beginJoin() {
   const current = joinAttempt;
-  if (!current || Date.now() > current.data.expires) { cancelJoin(); notice('Invite expired. Scan a new code.', true); return; }
+  if (!current?.ready || Date.now() > current.data.expires) { cancelJoin(); notice('Invite expired. Scan a new code.', true); return; }
   localName = normalizeName($('join-name').value,24);
   if (!localName) return;
   newSessionSlot();
   memberId = token(12); memberKey = token();
+  show('joining'); $('joining-text').textContent = 'Joining ' + current.data.roomName + '...';
+  clearTimeout(current.timer);
+  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Admission timed out. Ask for a new invite.',true); } },10000);
+  void current.request.send({id:memberId,key:memberKey,name:localName},{target:current.data.host}).catch(() => {
+    if (joinAttempt === current) { cancelJoin(); notice('The inviter disconnected. Ask for a new code.',true); }
+  });
+}
+function startInviteConnection(current) {
+  show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...'; notice('');
   const room = joinRoom(configFor(current.data.appId,current.data.secret), 'invite-' + current.data.id, {
     onPeerHandshake: async (peerId, send, receive, isInitiator) => {
       if (peerId !== current.data.host || joinAttempt !== current) throw new Error('Unexpected inviter');
@@ -457,17 +485,25 @@ function beginJoin() {
     }
   });
   current.room = room;
-  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request');
+  const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request'), ready = room.makeAction('ready');
+  current.request = request;
   room.onPeerJoin = peerId => {
     if (peerId !== current.data.host || joinAttempt !== current) return;
-    $('joining-text').textContent = 'Joining ' + current.data.roomName + '...';
+    $('joining-text').textContent = 'Verifying invite for ' + current.data.roomName + '...';
+  };
+  ready.onMessage = ({inviteId}, {peerId}) => {
+    if (joinAttempt !== current || peerId !== current.data.host || inviteId !== current.data.id) return;
+    current.ready = true;
     clearTimeout(current.timer);
-    current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('Admission timed out. Ask for a new invite.',true); } },10000);
-    void request.send({id:memberId,key:memberKey,name:localName},{target:peerId}).catch(() => {});
+    show('join-setup'); $('join-name').focus();
+  };
+  room.onPeerLeave = peerId => {
+    if (joinAttempt === current && !current.admitted && peerId === current.data.host) {
+      cancelJoin(); notice('The inviter disconnected. Ask for a new code.',true);
+    }
   };
   admit.onMessage = async (data, {peerId}) => {
     if (peerId !== current.data.host || joinAttempt !== current || data?.inviteId !== current.data.id || typeof data.meshId !== 'string' || !Array.isArray(data.members)) return;
-    clearTimeout(current.timer);
     if (!/^[A-Za-z0-9_-]{24}$/.test(data.meshId) || !/^[A-Za-z0-9_-]{24}$/.test(data.meshKey)) return;
     const roster = new Map();
     for (const entry of data.members) {
@@ -475,13 +511,14 @@ function beginJoin() {
       roster.set(entry[0],entry[1]);
     }
     if (roster.get(memberId)?.key !== memberKey) return;
+    clearTimeout(current.timer);
+    current.admitted = true;
     members.clear(); for (const [id,member] of roster) members.set(id,member);
     sessionAppId = current.data.appId; roomName = data.roomName; openMesh(data.meshId, data.meshKey);
     await ack.send({inviteId:current.data.id}, {target:peerId}).catch(() => {});
     setTimeout(() => { room.leave(); if (joinAttempt === current) joinAttempt = null; }, 500);
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
-  show('joining'); $('joining-text').textContent = 'Checking invite for ' + current.data.roomName + '...';
   current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('The inviter could not be reached. The code may be closed, or the signaling relay may be slow. Ask for a fresh invite.', true); } }, 12000);
 }
 async function leaveRoom() {
