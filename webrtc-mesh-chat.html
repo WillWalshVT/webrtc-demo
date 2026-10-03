@@ -70,6 +70,7 @@ dialog::backdrop{background:#11252999}
 .dialog-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
 .dialog-head h2{margin:0}
 .scanner-video{width:100%;aspect-ratio:4/3;object-fit:contain;background:#182b2d;border-radius:4px;margin:16px 0}
+.scanner-video.mirrored{transform:scaleX(-1)}
 .scanner-tools{display:grid;gap:14px;margin-top:16px}
 .scanner-tools .field{margin:0;max-width:none}
 .file-input{padding:8px}
@@ -84,6 +85,7 @@ dialog::backdrop{background:#11252999}
   <h1>Start a session</h1>
   <p class="muted">Connect devices directly with a QR exchange.</p>
   <div class="field"><label for="username">Your name</label><input id="username" maxlength="24" autocomplete="nickname" required placeholder="Enter a username"></div>
+  <div class="field"><label for="room-name">Room name <span class="muted small">(when creating)</span></label><input id="room-name" maxlength="48" placeholder="Name your room"></div>
   <div class="actions"><button class="button primary" id="create">Create</button><button class="button" id="join">Join</button></div>
   <p id="prefill" class="banner" hidden></p>
 </section>
@@ -93,14 +95,14 @@ dialog::backdrop{background:#11252999}
   <div class="pair-panel"><h2>Your client code</h2><p>Have the inviting device select <strong>Scan client code</strong> and scan this QR.</p><div id="answer-qr" class="qr"></div><div class="actions"><button class="button" id="copy-answer">Copy code</button><button class="button quiet" id="cancel-join">Cancel</button></div><p id="answer-copy" class="link-line" hidden></p></div>
 </section>
 <section id="room" hidden>
-  <div class="room-head"><div><h1>Chatroom</h1><div id="room-summary" class="muted small"></div></div><div class="room-actions"><button class="button primary" id="add-client">Add client</button><button class="button quiet" id="leave">Leave</button></div></div>
+  <div class="room-head"><div><h1 id="room-title">Chatroom</h1><div id="room-summary" class="muted small"></div></div><div class="room-actions"><button class="button primary" id="add-client">Add client</button><button class="button quiet" id="leave">Leave</button></div></div>
   <div class="layout"><div class="conversation"><div id="history-state" class="history-state" hidden>Loading earlier messages…</div><div id="messages" class="messages" role="log" aria-live="polite"><p class="empty">Messages will appear here.</p></div><form id="composer" class="composer"><input id="message" maxlength="2000" autocomplete="off" aria-label="Message" placeholder="Message the room"><button class="button primary" type="submit">Send</button></form></div><aside class="peers"><h2>People <span id="peer-count">(1)</span></h2><ul id="peer-list" class="peer-list"></ul><p id="mesh-state" class="hint"></p></aside></div>
 </section>
 <p id="notice" class="banner" role="status" hidden></p>
 </main>
 </div>
 <dialog id="invite-dialog"><div class="dialog-inner"><div class="dialog-head"><h2>Invite a client</h2><button class="button quiet" id="cancel-invite" aria-label="Close invitation">Close</button></div><p class="hint">Scan this QR on the other device. It can open this page directly.</p><div id="invite-qr" class="qr"></div><div class="actions"><button class="button primary" id="scan-answer" hidden>Scan client code</button><button class="button" id="copy-invite" disabled>Copy invite link</button></div><p id="invite-copy" class="link-line" hidden></p><p id="invite-note" class="hint"></p></div></dialog>
-<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
+<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><div class="actions"><button class="button" id="flip-camera" hidden>Switch camera</button><button class="button" id="mirror-camera" hidden>Mirror preview</button></div><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
@@ -112,11 +114,11 @@ const STUN = [{urls:'stun:stun.l.google.com:19302'}];
 const peers = new Map();
 const members = new Map();
 const seen = new Set();
-const offlineTimers = new Map();
 const pendingCandidates = new Map();
-const history = new Map();
-let localId, localName, roomId, pendingInvite, pendingJoin, inviteLink, answerCode;
+const chatHistory = new Map();
+let localId, localName, roomId, roomName, pendingInvite, pendingJoin, inviteLink, answerCode;
 let scanStream, scanFrame, scanKind, scanLast = 0, barcodeDetector, scanAttempts = 0, scanBusy = false;
+let cameraDevices = [], cameraIndex = -1, scannerRun = 0;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
 
@@ -136,6 +138,12 @@ $('username').addEventListener('input', () => $('username').setCustomValidity(''
 function makeId() { return crypto.randomUUID(); }
 function isId(value) { return typeof value === 'string' && /^[0-9a-f-]{36}$/i.test(value); }
 function isName(value) { return typeof value === 'string' && value.trim().length > 0 && value.length <= 24; }
+function isRoomName(value) { return typeof value === 'string' && value.trim().length > 0 && value.length <= 48; }
+function clearPrefill() {
+  $('prefill').hidden = true;
+  $('prefill').textContent = '';
+  delete $('prefill').dataset.code;
+}
 function encode(data) {
   const bytes = pako.deflate(JSON.stringify(data));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -190,13 +198,11 @@ function rememberMember(id, name) {
 function peerGone(peer) {
   if (!peer.id || peers.get(peer.id) !== peer) return;
   peers.delete(peer.id);
-  clearTimeout(offlineTimers.get(peer.id));
-  const id = peer.id;
-  offlineTimers.set(id, setTimeout(() => {
-    if (peers.get(id)?.dc?.readyState !== 'open') members.delete(id);
-    offlineTimers.delete(id); renderPeers();
-  }, 15000));
-  setTimeout(() => { if (members.has(id)) void maybeConnect(id); }, 500);
+  members.delete(peer.id);
+  if (roomId) {
+    const message = {kind:'leave', id:makeId(), room:roomId, from:peer.id, hops:16};
+    rememberEnvelope(message.id); flood(message);
+  }
   renderPeers();
 }
 function newPeer(id, name, createChannel = false) {
@@ -248,7 +254,7 @@ function roster() {
   return [{id:localId, name:localName}, ...[...peers.values()].filter(peer => peer.id && peer.dc?.readyState === 'open').map(peer => ({id:peer.id, name:peer.name}))];
 }
 function startHistory(peer) {
-  const items = [...history.values()].sort((a,b) => b.time - a.time || b.id.localeCompare(a.id));
+  const items = [...chatHistory.values()].sort((a,b) => b.time - a.time || b.id.localeCompare(a.id));
   let offset = 0;
   function batch() {
     if (peer.dc?.readyState !== 'open') return;
@@ -266,7 +272,6 @@ function attach(peer, dc) {
   dc.onopen = () => {
     notice('');
     if (peer.id && peers.get(peer.id) !== peer) peers.set(peer.id, peer);
-    clearTimeout(offlineTimers.get(peer.id)); offlineTimers.delete(peer.id);
     send(peer, {kind:'hello', room:roomId, id:localId, name:localName});
     send(peer, {kind:'roster', room:roomId, members:roster()});
     if (peer.id) { rememberMember(peer.id, peer.name); announce({id:peer.id, name:peer.name}); }
@@ -291,10 +296,7 @@ function attach(peer, dc) {
       if (peer.pc.signalingState !== 'closed') peer.pc.close();
     }
   };
-  dc.onerror = () => {
-    if (peer.pc.connectionState !== 'closed' && peer.id && peers.get(peer.id) === peer)
-      notice('A peer connection reported an error.', true);
-  };
+  dc.onerror = () => {};
 }
 async function handleMessage(peer, message) {
   if (message.kind === 'hello') {
@@ -326,7 +328,6 @@ async function handleMessage(peer, message) {
     if (!rememberEnvelope(message.id) || !isId(message.from)) return;
     const leaving = peers.get(message.from);
     if (leaving) dropPeer(leaving);
-    clearTimeout(offlineTimers.get(message.from)); offlineTimers.delete(message.from);
     members.delete(message.from); renderPeers();
     if (message.hops > 0) flood({...message, hops:message.hops-1}, peer.id);
   }
@@ -404,12 +405,12 @@ async function gatherForQr(pc) {
   });
 }
 function recordChat(message, render = true) {
-  if (!isId(message.id) || !isId(message.from) || !isName(message.name) || typeof message.text !== 'string' || message.text.length > 2000 || history.has(message.id)) return false;
+  if (!isId(message.id) || !isId(message.from) || !isName(message.name) || typeof message.text !== 'string' || message.text.length > 2000 || chatHistory.has(message.id)) return false;
   const time = Number.isFinite(message.time) ? message.time : Date.now();
-  history.set(message.id, {id:message.id, from:message.from, name:message.name, text:message.text, time});
-  if (history.size > 1000) {
-    const oldest = [...history.values()].sort((a,b) => a.time - b.time || a.id.localeCompare(b.id))[0];
-    history.delete(oldest.id);
+  chatHistory.set(message.id, {id:message.id, from:message.from, name:message.name, text:message.text, time});
+  if (chatHistory.size > 1000) {
+    const oldest = [...chatHistory.values()].sort((a,b) => a.time - b.time || a.id.localeCompare(b.id))[0];
+    chatHistory.delete(oldest.id);
   }
   if (render) renderMessages();
   return true;
@@ -420,8 +421,8 @@ function renderMessages() {
   const oldHeight = list.scrollHeight;
   const oldTop = list.scrollTop;
   list.textContent = '';
-  if (!history.size) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'Messages will appear here.'; list.append(empty); }
-  for (const message of [...history.values()].sort((a,b) => a.time - b.time || a.id.localeCompare(b.id))) {
+  if (!chatHistory.size) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'Messages will appear here.'; list.append(empty); }
+  for (const message of [...chatHistory.values()].sort((a,b) => a.time - b.time || a.id.localeCompare(b.id))) {
     const item = document.createElement('div'); item.className = 'message' + (message.from === localId ? ' mine' : '');
     const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = message.name;
     const body = document.createElement('p'); body.textContent = message.text;
@@ -430,15 +431,14 @@ function renderMessages() {
   list.scrollTop = atBottom ? list.scrollHeight : oldTop + list.scrollHeight - oldHeight;
 }
 function resetRoom() {
-  for (const timer of offlineTimers.values()) clearTimeout(timer);
-  offlineTimers.clear();
   for (const peer of peers.values()) { clearTimeout(peer.failureTimer); peer.pc.close(); }
   if (pendingInvite) pendingInvite.peer.pc.close();
-  peers.clear(); members.clear(); seen.clear(); pendingCandidates.clear(); history.clear();
+  peers.clear(); members.clear(); seen.clear(); pendingCandidates.clear(); chatHistory.clear();
   pendingInvite = null; pendingJoin = null; inviteLink = null; answerCode = null;
-  localId = null; roomId = null;
+  localId = null; roomId = null; roomName = null;
   $('invite-dialog').close(); $('scan-answer').hidden = true;
   $('history-state').hidden = true; renderMessages();
+  clearPrefill();
   show('entry');
 }
 async function createInvite() {
@@ -456,7 +456,7 @@ async function createInvite() {
     await peer.pc.setLocalDescription(await peer.pc.createOffer());
     await gatherForQr(peer.pc);
     if (pendingInvite?.peer !== peer) return;
-    const offer = {v:1, kind:'offer', room:roomId, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
+    const offer = {v:1, kind:'offer', room:roomId, roomName, expires:Date.now()+300000, nonce, from:{id:localId, name:localName}, description:peer.pc.localDescription};
     const token = encode(offer);
     inviteLink = APP_URL + '#invite=' + token;
     try { qr(inviteLink, $('invite-qr')); }
@@ -480,13 +480,16 @@ async function joinOffer(raw) {
   if (token.startsWith('MESH1:')) token = token.slice(6);
   else if (token.includes('#invite=')) token = token.split('#invite=')[1];
   const offer = decode(token);
-  if (offer.v !== 1 || offer.kind !== 'offer' || !isId(offer.room) || !isId(offer.nonce) || !isId(offer.from?.id) || !isName(offer.from?.name) || offer.description?.type !== 'offer' || typeof offer.description.sdp !== 'string' || offer.description.sdp.length > 50000) throw new Error('This is not a valid mesh invite.');
-  localId = makeId(); localName = name; roomId = offer.room;
+  if (offer.v !== 1 || offer.kind !== 'offer' || !isId(offer.room) || !isRoomName(offer.roomName) || !isId(offer.nonce) || !isId(offer.from?.id) || !isName(offer.from?.name) || offer.description?.type !== 'offer' || typeof offer.description.sdp !== 'string' || offer.description.sdp.length > 50000) throw new Error('This is not a valid mesh invite.');
+  if (!Number.isFinite(offer.expires) || Date.now() > offer.expires) throw new Error('This invite has expired. Scan a new code.');
+  clearPrefill();
+  localId = makeId(); localName = name; roomId = offer.room; roomName = offer.roomName.trim();
+  $('room-title').textContent = roomName;
   const peer = newPeer(offer.from.id, offer.from.name);
   pendingJoin = {peer};
   rememberMember(peer.id, peer.name);
   show('joining');
-  $('joining-text').textContent = 'Connecting to ' + peer.name + '. Preparing your answer code…';
+  $('joining-text').textContent = 'Joining ' + roomName + ' with ' + peer.name + '. Preparing your answer code…';
   try {
     await peer.pc.setRemoteDescription(offer.description);
     await peer.pc.setLocalDescription(await peer.pc.createAnswer());
@@ -495,7 +498,7 @@ async function joinOffer(raw) {
     answerCode = 'MESH1:' + encode(answer);
     qr(answerCode, $('answer-qr'));
     $('answer-copy').textContent = answerCode;
-    $('joining-text').textContent = 'Waiting for ' + peer.name + ' to scan your code.';
+    $('joining-text').textContent = 'Joining ' + roomName + '. Waiting for ' + peer.name + ' to scan your code.';
   } catch (error) { dropPeer(peer); resetRoom(); throw error; }
 }
 async function acceptAnswer(raw) {
@@ -513,7 +516,8 @@ async function acceptAnswer(raw) {
   notice('Connecting to ' + peer.name + '…');
 }
 function decodeImage(source, width, height, focused = false) {
-  const crop = focused ? Math.min(width, height) * .85 : 0;
+  if (typeof jsQR !== 'function') return null;
+  const crop = focused ? Math.min(width, height) * .75 : 0;
   const sourceWidth = focused ? crop : width;
   const sourceHeight = focused ? crop : height;
   const scale = Math.min(1, (focused ? 1400 : 2200) / Math.max(sourceWidth, sourceHeight));
@@ -521,14 +525,17 @@ function decodeImage(source, width, height, focused = false) {
   scanCanvas.height = Math.max(1, Math.round(sourceHeight * scale));
   scanContext.drawImage(source, (width-sourceWidth)/2, (height-sourceHeight)/2, sourceWidth, sourceHeight, 0, 0, scanCanvas.width, scanCanvas.height);
   const image = scanContext.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-  return jsQR(image.data, image.width, image.height, {inversionAttempts:'dontInvert'})?.data;
+  return jsQR(image.data, image.width, image.height, {inversionAttempts:'attemptBoth'})?.data;
 }
 function stopScanner() {
+  scannerRun++;
   cancelAnimationFrame(scanFrame);
   scanStream?.getTracks().forEach(track => track.stop());
   scanStream = null;
   $('scanner-video').srcObject = null;
   $('scanner-video').hidden = true;
+  $('flip-camera').hidden = true;
+  $('mirror-camera').hidden = true;
 }
 async function useCode(raw) {
   if (scanBusy) return false;
@@ -547,6 +554,7 @@ async function openScanner(kind) {
   $('scanner-note').textContent = 'Fill the camera view with the QR code, or scan a screenshot or paste a code.';
   $('scan-text').value = ''; $('scan-file').value = '';
   $('scanner').showModal();
+  cameraIndex = -1;
   try {
     barcodeDetector = null;
     if ('BarcodeDetector' in window) {
@@ -554,31 +562,56 @@ async function openScanner(kind) {
         if ((await BarcodeDetector.getSupportedFormats()).includes('qr_code')) barcodeDetector = new BarcodeDetector({formats:['qr_code']});
       } catch {}
     }
-    scanStream = await navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1440}}});
-    if (!$('scanner').open) { stopScanner(); return; }
-    const video = $('scanner-video'); video.srcObject = scanStream; video.hidden = false;
-    await video.play();
-    scanLast = 0;
-    async function tick(now) {
-      if (!scanStream || !$('scanner').open) return;
-      if (now - scanLast > 160 && video.videoWidth) {
-        scanLast = now;
-        scanAttempts++;
-        let code;
-        if (barcodeDetector) {
-          try { code = (await barcodeDetector.detect(video))[0]?.rawValue; } catch { barcodeDetector = null; }
-        }
-        if (!scanStream || !$('scanner').open) return;
-        if (!code) code = decodeImage(video, video.videoWidth, video.videoHeight, scanAttempts % 3 !== 0);
-        if (code && await useCode(code)) return;
+    await startCamera();
+  } catch { stopScanner(); $('scanner-note').textContent = 'Camera unavailable. Scan a screenshot or paste a code.'; }
+}
+async function startCamera(deviceId) {
+  const run = ++scannerRun;
+  cancelAnimationFrame(scanFrame);
+  scanStream?.getTracks().forEach(track => track.stop());
+  scanStream = null;
+  const video = $('scanner-video');
+  video.srcObject = null;
+  const constraints = deviceId ? {deviceId:{exact:deviceId}, width:{ideal:1920}, height:{ideal:1440}} : {facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1440}};
+  const stream = await navigator.mediaDevices.getUserMedia({audio:false, video:constraints});
+  if (run !== scannerRun || !$('scanner').open) { stream.getTracks().forEach(track => track.stop()); return; }
+  scanStream = stream;
+  video.srcObject = stream; video.hidden = false;
+  await video.play();
+  try { cameraDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput'); }
+  catch { cameraDevices = []; }
+  cameraIndex = cameraDevices.findIndex(device => device.deviceId === stream.getVideoTracks()[0].getSettings().deviceId);
+  $('flip-camera').hidden = cameraDevices.length < 2;
+  $('mirror-camera').hidden = false;
+  scanLast = 0;
+  async function tick(now) {
+    if (run !== scannerRun || !scanStream || !$('scanner').open) return;
+    if (now - scanLast > 120 && video.videoWidth) {
+      scanLast = now;
+      scanAttempts++;
+      let code;
+      if (barcodeDetector) {
+        try { code = (await barcodeDetector.detect(video))[0]?.rawValue; } catch { barcodeDetector = null; }
       }
-      scanFrame = requestAnimationFrame(tick);
+      if (run !== scannerRun || !scanStream || !$('scanner').open) return;
+      if (!code) code = decodeImage(video, video.videoWidth, video.videoHeight, scanAttempts % 2 === 0);
+      if (code && await useCode(code)) return;
     }
     scanFrame = requestAnimationFrame(tick);
-  } catch { stopScanner(); $('scanner-note').textContent = 'Camera unavailable. Scan a screenshot or paste a code.'; }
+  }
+  scanFrame = requestAnimationFrame(tick);
 }
 $('scanner').addEventListener('close', stopScanner);
 $('close-scanner').onclick = () => $('scanner').close();
+$('flip-camera').onclick = () => {
+  if (cameraDevices.length < 2) return;
+  cameraIndex = (cameraIndex + 1) % cameraDevices.length;
+  void startCamera(cameraDevices[cameraIndex].deviceId).catch(error => { $('scanner-note').textContent = 'Could not switch camera: ' + error.message; });
+};
+$('mirror-camera').onclick = () => {
+  const mirrored = $('scanner-video').classList.toggle('mirrored');
+  $('mirror-camera').textContent = mirrored ? 'Unmirror preview' : 'Mirror preview';
+};
 $('use-pasted-code').onclick = () => void useCode($('scan-text').value);
 $('scan-file').onchange = async event => {
   const file = event.target.files[0]; if (!file) return;
@@ -597,13 +630,19 @@ $('scan-file').onchange = async event => {
 };
 $('create').onclick = async () => {
   const name = nameFromInput(); if (!name) return;
-  localId = makeId(); localName = name; roomId = makeId();
+  const input = $('room-name'); input.value = input.value.trim();
+  if (!isRoomName(input.value)) { input.setCustomValidity('Enter a room name.'); input.reportValidity(); return; }
+  input.setCustomValidity('');
+  clearPrefill();
+  localId = makeId(); localName = name; roomId = makeId(); roomName = input.value;
+  $('room-title').textContent = roomName;
   show('room'); renderPeers(); await createInvite();
 };
+$('room-name').addEventListener('input', () => $('room-name').setCustomValidity(''));
 $('join').onclick = () => {
   if (!nameFromInput()) return;
   const prefill = $('prefill').dataset.code;
-  if (prefill) { void joinOffer(prefill).catch(error => notice(error.message, true)); }
+  if (prefill) { void joinOffer(prefill).catch(error => { clearPrefill(); notice(error.message, true); void openScanner('invite'); }); }
   else void openScanner('invite');
 };
 $('add-client').onclick = () => void createInvite();
@@ -625,6 +664,10 @@ $('leave').onclick = () => {
   rememberEnvelope(message.id); flood(message); resetRoom();
 };
 window.addEventListener('pagehide', () => {
+  if (localId && roomId) {
+    const message = {kind:'leave', id:makeId(), room:roomId, from:localId, hops:16};
+    flood(message);
+  }
   for (const peer of peers.values()) peer.pc.close();
   if (pendingInvite) pendingInvite.peer.pc.close();
   stopScanner();
@@ -634,9 +677,14 @@ if (!window.qrcode || !window.jsQR || !window.pako) {
   $('create').disabled = true; $('join').disabled = true;
 } else if (location.hash.startsWith('#invite=')) {
   $('prefill').hidden = false;
-  $('prefill').textContent = 'Invite detected. Enter your name and select Join.';
-  $('prefill').dataset.code = location.hash.slice(8);
-  history.replaceState(null, '', APP_URL);
+  try {
+    const code = location.hash.slice(8);
+    const offer = decode(code);
+    if (!isRoomName(offer.roomName) || !Number.isFinite(offer.expires) || Date.now() > offer.expires) throw new Error('Invite expired. Scan a new code.');
+    $('prefill').textContent = 'Invite to ' + offer.roomName.trim() + ' from ' + offer.from.name + '. Enter your name and select Join.';
+    $('prefill').dataset.code = code;
+  } catch (error) { clearPrefill(); notice(error.message, true); }
+  window.history.replaceState(null, '', APP_URL);
 }
 </script>
 </body>
