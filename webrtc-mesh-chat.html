@@ -73,6 +73,7 @@ dialog::backdrop{background:#11252999}
 .scanner-video.mirrored{transform:scaleX(-1)}
 .scanner-preview{position:relative;margin:16px 0}
 .scanner-preview .scanner-video{margin:0}
+.scanner-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .mirror-button{position:absolute;right:9px;bottom:9px;width:38px;height:38px;min-height:38px;padding:0;background:#fff;border-color:#fff;box-shadow:0 2px 8px #0005;font-size:23px;line-height:1}
 .scanner-tools{display:grid;gap:14px;margin-top:16px}
 .scanner-tools .field{margin:0;max-width:none}
@@ -104,7 +105,7 @@ dialog::backdrop{background:#11252999}
 </main>
 </div>
 <dialog id="invite-dialog"><div class="dialog-inner"><div class="dialog-head"><h2>Invite a client</h2><button class="button quiet" id="cancel-invite" aria-label="Close invitation">Close</button></div><p class="hint">Scan this QR on the other device. It can open this page directly.</p><div id="invite-qr" class="qr"></div><div class="actions"><button class="button primary" id="scan-answer" hidden>Scan client code</button><button class="button" id="copy-invite" disabled>Copy invite link</button></div><p id="invite-copy" class="link-line" hidden></p><p id="invite-note" class="hint"></p></div></dialog>
-<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><div class="scanner-preview"><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><button class="button mirror-button" id="mirror-camera" type="button" aria-label="Mirror preview" title="Mirror preview" hidden><span aria-hidden="true">⇄</span></button></div><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a photo or screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
+<dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2 id="scanner-title">Scan QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><div class="scanner-preview"><video id="scanner-video" class="scanner-video" autoplay muted playsinline hidden></video><canvas id="scanner-overlay" class="scanner-overlay" aria-hidden="true"></canvas><button class="button mirror-button" id="mirror-camera" type="button" aria-label="Mirror preview" title="Mirror preview" hidden><span aria-hidden="true">⇄</span></button></div><p id="scanner-note" class="hint"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a photo or screenshot</label><input class="file-input" id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste a link or code</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-pasted-code">Use pasted code</button></div></div></dialog>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
@@ -119,7 +120,8 @@ const seen = new Set();
 const pendingCandidates = new Map();
 const chatHistory = new Map();
 let localId, localName, roomId, roomName, pendingInvite, pendingJoin, inviteLink, answerCode, inviteTimer;
-let scanStream, scanFrame, scanKind, scanLast = 0, barcodeDetector, scanAttempts = 0, scanBusy = false;
+let scanStream, scanFrame, scanKind, scanLast = 0, barcodeDetector, scanAttempts = 0, scanBusy = false, outlineTimer;
+let lastRejectedCode = '', lastRejectedAt = 0;
 let scannerRun = 0, entryMode = null;
 const scanCanvas = document.createElement('canvas');
 const scanContext = scanCanvas.getContext('2d', {willReadFrequently:true});
@@ -541,16 +543,54 @@ function decodeImage(source, width, height, focused = false) {
   const crop = focused ? Math.min(width, height) * .75 : 0;
   const sourceWidth = focused ? crop : width;
   const sourceHeight = focused ? crop : height;
-  const scale = Math.min(1, (focused ? 1400 : 2200) / Math.max(sourceWidth, sourceHeight));
+  const scale = Math.min(1, (focused ? 1200 : 1600) / Math.max(sourceWidth, sourceHeight));
   scanCanvas.width = Math.max(1, Math.round(sourceWidth * scale));
   scanCanvas.height = Math.max(1, Math.round(sourceHeight * scale));
   scanContext.drawImage(source, (width-sourceWidth)/2, (height-sourceHeight)/2, sourceWidth, sourceHeight, 0, 0, scanCanvas.width, scanCanvas.height);
   const image = scanContext.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-  return jsQR(image.data, image.width, image.height, {inversionAttempts:'attemptBoth'})?.data;
+  const result = jsQR(image.data, image.width, image.height, {inversionAttempts:'dontInvert'});
+  if (!result) return null;
+  const toSource = point => ({x:(width-sourceWidth)/2 + point.x/scale, y:(height-sourceHeight)/2 + point.y/scale});
+  const location = result.location;
+  return {data:result.data, points:[location.topLeftCorner, location.topRightCorner, location.bottomRightCorner, location.bottomLeftCorner].map(toSource)};
+}
+function clearScanOutline() {
+  clearTimeout(outlineTimer);
+  const canvas = $('scanner-overlay');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+function showScanOutline(points) {
+  if (!points?.length) return;
+  clearTimeout(outlineTimer);
+  const video = $('scanner-video');
+  const canvas = $('scanner-overlay');
+  const width = video.clientWidth, height = video.clientHeight;
+  if (!width || !height || !video.videoWidth || !video.videoHeight) return;
+  const density = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width*density); canvas.height = Math.round(height*density);
+  const context = canvas.getContext('2d');
+  context.scale(density, density);
+  const scale = Math.min(width/video.videoWidth, height/video.videoHeight);
+  const offsetX = (width-video.videoWidth*scale)/2, offsetY = (height-video.videoHeight*scale)/2;
+  const mirrored = video.classList.contains('mirrored');
+  context.beginPath();
+  points.forEach((point, index) => {
+    const x = offsetX + point.x*scale;
+    const y = offsetY + point.y*scale;
+    if (index) context.lineTo(mirrored ? width-x : x, y);
+    else context.moveTo(mirrored ? width-x : x, y);
+  });
+  context.closePath();
+  context.lineWidth = 4;
+  context.strokeStyle = '#b8ff5b';
+  context.shadowColor = '#10291d'; context.shadowBlur = 8;
+  context.stroke();
+  outlineTimer = setTimeout(clearScanOutline, 800);
 }
 function stopScanner() {
   scannerRun++;
   cancelAnimationFrame(scanFrame);
+  clearScanOutline();
   scanStream?.getTracks().forEach(track => track.stop());
   scanStream = null;
   $('scanner-video').srcObject = null;
@@ -574,6 +614,7 @@ async function useCode(raw) {
 }
 async function openScanner(kind) {
   scanKind = kind;
+  lastRejectedCode = ''; lastRejectedAt = 0;
   $('scanner-title').textContent = kind === 'invite' ? 'Scan invite QR' : 'Scan client code';
   $('scanner-note').textContent = 'Fill the camera view with the QR code, or scan a screenshot or paste a code.';
   $('scan-text').value = ''; $('scan-file').value = '';
@@ -613,13 +654,25 @@ async function startCamera() {
     if (now - scanLast > 120 && video.videoWidth) {
       scanLast = now;
       scanAttempts++;
-      let code;
+      let detected;
       if (barcodeDetector) {
-        try { code = (await barcodeDetector.detect(video))[0]?.rawValue; } catch { barcodeDetector = null; }
+        try {
+          const result = (await barcodeDetector.detect(video))[0];
+          if (result) detected = {data:result.rawValue, points:result.cornerPoints};
+        } catch { barcodeDetector = null; }
       }
       if (run !== scannerRun || !scanStream || !$('scanner').open) return;
-      if (!code) code = decodeImage(video, video.videoWidth, video.videoHeight, scanAttempts % 2 === 0);
-      if (code && await useCode(code)) return;
+      if (!detected) detected = decodeImage(video, video.videoWidth, video.videoHeight, scanAttempts % 2 === 0);
+      if (detected?.data) {
+        showScanOutline(detected.points);
+        if (detected.data !== lastRejectedCode || Date.now()-lastRejectedAt > 1500) {
+          $('scanner-note').textContent = 'QR found. Reading connection details…';
+          await new Promise(resolve => setTimeout(resolve, 280));
+          if (run !== scannerRun || !scanStream || !$('scanner').open) return;
+          if (await useCode(detected.data)) return;
+          lastRejectedCode = detected.data; lastRejectedAt = Date.now();
+        }
+      }
     }
     scanFrame = requestAnimationFrame(tick);
   }
@@ -642,7 +695,7 @@ $('scan-file').onchange = async event => {
     if ('BarcodeDetector' in window) {
       try { code = (await new BarcodeDetector({formats:['qr_code']}).detect(image))[0]?.rawValue; } catch {}
     }
-    code ||= decodeImage(image, image.naturalWidth, image.naturalHeight) || decodeImage(image, image.naturalWidth, image.naturalHeight, true);
+    code ||= decodeImage(image, image.naturalWidth, image.naturalHeight)?.data || decodeImage(image, image.naturalWidth, image.naturalHeight, true)?.data;
     if (!code) throw new Error('No readable QR code found.');
     await useCode(code);
   } catch (error) { $('scanner-note').textContent = error.message; }
