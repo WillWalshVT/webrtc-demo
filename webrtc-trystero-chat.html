@@ -70,6 +70,8 @@ dialog::backdrop{background:#11252999}
 .qr{display:grid;place-items:center;margin:12px 0;background:white;min-height:190px}
 .qr svg{width:min(100%,560px);height:auto;display:block;shape-rendering:crispEdges}
 .link-line{font-size:13px;color:#355861;overflow-wrap:anywhere;margin:12px 0}
+.relay-status{font-size:13px;margin:0;color:#355861}
+.relay-status[data-state="offline"]{color:#913c31}
 .preview{position:relative;margin:16px 0}
 .preview video{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#182b2d;border-radius:4px}
 .preview video.mirrored{transform:scaleX(-1)}
@@ -115,14 +117,14 @@ dialog::backdrop{background:#11252999}
 <p id="notice" class="banner" role="status" hidden></p>
 </main>
 </div>
-<dialog id="invite-dialog"><div class="dialog-inner"><div class="dialog-head"><h2>Invite a client</h2><button class="button quiet" id="close-invite" aria-label="Close invitation">Close</button></div><div id="invite-options"><label class="checkbox"><input id="invite-multi" type="checkbox">Allow multiple connections</label><button class="button primary" id="show-invite">Show QR code</button></div><div id="invite-active" hidden><p class="muted small" id="invite-status"></p><div class="qr" id="invite-qr"></div><div class="actions"><button class="button" id="copy-invite">Copy invite link</button></div><p class="link-line" id="invite-link" hidden></p></div></div></dialog>
+<dialog id="invite-dialog"><div class="dialog-inner"><div class="dialog-head"><h2>Invite a client</h2><button class="button quiet" id="close-invite" aria-label="Close invitation">Close</button></div><div id="invite-options"><label class="checkbox"><input id="invite-multi" type="checkbox">Allow multiple connections</label><button class="button primary" id="show-invite">Show QR code</button></div><div id="invite-active" hidden><p class="muted small" id="invite-status"></p><p class="relay-status" id="relay-status" role="status" aria-live="polite"></p><div class="qr" id="invite-qr"></div><div class="actions"><button class="button" id="copy-invite">Copy invite link</button></div><p class="link-line" id="invite-link" hidden></p></div></div></dialog>
 <dialog id="scanner"><div class="dialog-inner"><div class="dialog-head"><h2>Scan invite QR</h2><button class="button quiet" id="close-scanner" aria-label="Close scanner">Close</button></div><div class="preview"><video id="scanner-video" autoplay muted playsinline hidden></video><canvas id="scanner-overlay" aria-hidden="true"></canvas><button class="button mirror" id="mirror" type="button" aria-label="Mirror preview" title="Mirror preview" hidden>⇄</button></div><p id="scanner-note" class="muted small"></p><div class="scanner-tools"><div class="field"><label for="scan-file">Scan a photo or screenshot</label><input id="scan-file" type="file" accept="image/*"></div><div class="field"><label for="scan-text">Or paste an invite link</label><textarea id="scan-text" rows="2"></textarea></div><button class="button" id="use-code">Use pasted link</button></div></div></dialog>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script type="module">
-let joinRoom, selfId;
+let joinRoom, selfId, getRelaySockets;
 try {
-  ({joinRoom, selfId} = await import('https://esm.run/trystero@0.25.4'));
+  ({joinRoom, selfId, getRelaySockets} = await import('https://esm.run/trystero@0.25.4'));
 } catch {
   document.getElementById('notice').textContent = 'Could not load the peer connection library. Check your connection and reload.';
   document.getElementById('notice').hidden = false;
@@ -392,7 +394,25 @@ function revokeMember(id) {
 function releaseInviteRoom(current) {
   if (!current || current.open || [...fastLinks.values()].some(link => link.invite === current)) return;
   if (invite === current) { invite = null; clearTimeout(current.timer); }
+  clearInterval(current.relayTimer);
   current.room.leave(); inviteRooms.delete(current);
+}
+function updateRelayStatus() {
+  if (!invite) return;
+  const sockets = Object.values(getRelaySockets());
+  const connected = sockets.filter(socket => socket.readyState === WebSocket.OPEN).length;
+  const connecting = sockets.filter(socket => socket.readyState === WebSocket.CONNECTING).length;
+  const status = $('relay-status');
+  if (!navigator.onLine) {
+    status.textContent = 'Signaling: this device is offline.';
+    status.dataset.state = 'offline';
+  } else if (connected) {
+    status.textContent = 'Signaling: ' + connected + ' relay' + (connected === 1 ? '' : 's') + ' connected. Waiting for the joining device.';
+    status.dataset.state = 'connected';
+  } else {
+    status.textContent = 'Signaling: ' + (connecting ? 'connecting to relays…' : 'no relay connected; retrying…');
+    status.dataset.state = 'offline';
+  }
 }
 function closeInvite() {
   const active = invite; invite = null;
@@ -400,6 +420,7 @@ function closeInvite() {
   if ($('invite-dialog').open) $('invite-dialog').close();
   if (!active) return;
   clearTimeout(active.timer);
+  clearInterval(active.relayTimer);
   active.open = false;
   for (const [peerId,addedId] of active.pending) {
     if (!active.admitted.has(peerId) && !mesh?.getPeers()[peerId]) {
@@ -425,7 +446,7 @@ function createInvite(multi) {
   });
   const admit = room.makeAction('admit'), ack = room.makeAction('ack'), deny = room.makeAction('deny'), request = room.makeAction('request'), ready = room.makeAction('ready');
   const fastChat = room.makeAction('fast-chat'), fastHistory = room.makeAction('fast-history');
-  const current = {id, room, admit, ack, deny, fastChat, fastHistory, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null};
+  const current = {id, room, admit, ack, deny, fastChat, fastHistory, multi, expires, open:true, claimed:null, pending:new Map(), admitted:new Set(), timer:null, relayTimer:null};
   invite = current;
   inviteRooms.add(current);
   fastChat.onMessage = (item,{peerId}) => {
@@ -483,6 +504,8 @@ function createInvite(multi) {
   const link = APP_URL + '?pair=' + id + '#invite=' + encode(payload);
   $('invite-options').hidden = true; $('invite-active').hidden = false;
   $('invite-status').textContent = multi ? 'Invite open for multiple clients.' : 'Invite open for one client.';
+  updateRelayStatus();
+  current.relayTimer = setInterval(updateRelayStatus, 1000);
   qr(link, $('invite-qr'));
   $('invite-link').textContent = link; $('invite-link').hidden = true;
   $('invite-dialog').showModal();
@@ -524,7 +547,7 @@ function parseInvite(raw) {
 function prepareJoin(raw) {
   const data = parseInvite(raw);
   if (joinAttempt) cancelJoin();
-  joinAttempt = {data, room:null, timer:null, ready:false, startedAt:performance.now()};
+  joinAttempt = {data, room:null, timer:null, progressTimer:null, ready:false, startedAt:performance.now()};
   $('join-room-name').textContent = data.roomName;
   $('join-description').textContent = 'Invited to ' + data.roomName;
   if ($('scanner').open) $('scanner').close();
@@ -533,6 +556,7 @@ function prepareJoin(raw) {
 function cancelJoin() {
   if (joinAttempt?.room) joinAttempt.room.leave();
   clearTimeout(joinAttempt?.timer);
+  clearTimeout(joinAttempt?.progressTimer);
   joinAttempt = null;
   show('home');
 }
@@ -587,6 +611,7 @@ function startInviteConnection(current) {
     if (joinAttempt !== current || peerId !== current.data.host || inviteId !== current.data.id) return;
     current.ready = true;
     clearTimeout(current.timer);
+    clearTimeout(current.progressTimer);
     $('join-description').textContent = 'Invite verified. Enter your name to join ' + current.data.roomName + '.';
     show('join-setup'); $('join-name').focus();
   };
@@ -619,7 +644,10 @@ function startInviteConnection(current) {
     current.timer = setTimeout(() => { if (joinAttempt === current) joinAttempt = null; }, 30000);
   };
   deny.onMessage = (message, {peerId}) => { if (peerId === current.data.host && joinAttempt === current) { cancelJoin(); notice(typeof message === 'string' ? message : 'Invite closed.', true); } };
-  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('The inviter could not be reached. The code may be closed, or the signaling relay may be slow. Ask for a fresh invite.', true); } }, 12000);
+  current.progressTimer = setTimeout(() => {
+    if (joinAttempt === current && !current.ready) $('joining-text').textContent = 'Still looking for the inviter through signaling relays…';
+  }, 12000);
+  current.timer = setTimeout(() => { if (joinAttempt === current) { cancelJoin(); notice('The inviter could not be reached. Ask them to check the signaling status beside the QR code and keep the invite open.', true); } }, 30000);
 }
 async function leaveRoom() {
   closeInvite(); cancelJoin();
